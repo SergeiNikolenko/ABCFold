@@ -156,7 +156,9 @@ def build_af3_command(
         return argv
 
     if needs_models and not cfg.model_dir:
-        raise ValueError("AlphaFold 3 inference needs a model directory (--model_params)")
+        raise ValueError(
+            "AlphaFold 3 inference needs a model directory (--model_params)"
+        )
     if needs_dbs and not cfg.db_dir:
         raise ValueError(
             "The AlphaFold 3 data pipeline needs a database directory (--database)"
@@ -230,7 +232,9 @@ def prepare_inference_input(params: dict) -> dict:
     for entry in params.get("sequences", []):
         if "protein" in entry:
             protein = entry["protein"]
-            if protein.get("unpairedMsa") is None and not protein.get("unpairedMsaPath"):
+            if protein.get("unpairedMsa") is None and not protein.get(
+                "unpairedMsaPath"
+            ):
                 logger.warning(
                     "AF3 inference-only: chain %s has no MSA, using single sequence",
                     protein.get("id"),
@@ -273,7 +277,8 @@ class Af3Result:
 
 
 def find_af3_job_dir(output_dir: Path | str, name: str) -> Optional[Path]:
-    """Locate ``<output_dir>/<name>`` or AF3's timestamped ``<name>_YYYYMMDD_HHMMSS``."""
+    """Locate ``<output_dir>/<name>`` or AF3's timestamped
+    ``<name>_YYYYMMDD_HHMMSS``."""
     output_dir = Path(output_dir)
     base = sanitised_name(name)
     candidates = [p for p in output_dir.glob(f"{base}*") if p.is_dir() and (
