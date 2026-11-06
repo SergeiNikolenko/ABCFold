@@ -304,6 +304,10 @@ class ContainerEnv:
         return MicromambaEnv.run(self, *args, **kwargs)  # type: ignore[arg-type]
 
 
+# Either kind of environment a backend can run in.
+BackendEnv = Union[MicromambaEnv, ContainerEnv]
+
+
 def pull_image(spec: "BackendEnvSpec", dry_run: bool = False) -> List[List[str]]:
     """Fetch a backend image. Apptainer builds a local .sif, docker pulls."""
     assert spec.image is not None
@@ -686,7 +690,7 @@ def container_binds(settings) -> List[str]:
 
 def ensure_backend_env(
     name: str, config: Mapping
-) -> Union[MicromambaEnv, ContainerEnv]:
+) -> BackendEnv:
     """Verify the env of ``name`` using the runtime config and return it."""
     settings = config.get("_settings")
     if settings is None:

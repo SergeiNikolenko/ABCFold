@@ -3,14 +3,14 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from abcfold.backend_envs import MicromambaEnv, ensure_backend_env
+from abcfold.backend_envs import BackendEnv, ensure_backend_env
 
 logger = logging.getLogger("logger")
 
 DEFAULT_CHECKPOINT = "openbind-2025-06-30-174k"
 
 
-def ensure_openfold_env(config: dict) -> MicromambaEnv:
+def ensure_openfold_env(config: dict) -> BackendEnv:
     """Verify (never modify) the pinned OpenFold3 environment."""
     return ensure_backend_env("openfold3", config)
 
@@ -23,7 +23,7 @@ def openfold_cache_dir(config: dict) -> Path:
 
 
 def ensure_openfold_checkpoint(
-    env: MicromambaEnv,
+    env: BackendEnv,
     cache_dir: Path,
     checkpoint_name: Optional[str] = None,
 ) -> None:

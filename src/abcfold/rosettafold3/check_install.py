@@ -2,7 +2,7 @@ import logging
 import urllib.request
 from pathlib import Path
 
-from abcfold.backend_envs import MicromambaEnv, ensure_backend_env
+from abcfold.backend_envs import BackendEnv, ensure_backend_env
 
 logger = logging.getLogger("logger")
 
@@ -36,6 +36,6 @@ def ensure_rosettafold_checkpoint(target_path: Path) -> Path:
     return target_path
 
 
-def ensure_rosettafold_env(config: dict) -> MicromambaEnv:
+def ensure_rosettafold_env(config: dict) -> BackendEnv:
     """Verify (never modify) the pinned RoseTTAFold3 environment."""
     return ensure_backend_env("rosettafold3", config)

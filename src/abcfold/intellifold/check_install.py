@@ -1,6 +1,6 @@
 import logging
 
-from abcfold.backend_envs import MicromambaEnv, ensure_backend_env
+from abcfold.backend_envs import BackendEnv, ensure_backend_env
 
 logger = logging.getLogger("logger")
 
@@ -15,7 +15,7 @@ ENGINE_BUILD_HINT = (
 )
 
 
-def ensure_intellifold_env(config: dict) -> MicromambaEnv:
+def ensure_intellifold_env(config: dict) -> BackendEnv:
     """Verify (never modify) the pinned IntelliFold environment.
 
     The ``intellifold`` wheel is a thin wrapper around a vendored AlphaFold 3
