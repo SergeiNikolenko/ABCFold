@@ -147,8 +147,13 @@ def _rows_from_csv(path: Path) -> List[Dict[str, Any]]:
     with path.open(newline="") as handle:
         sample = handle.read(4096)
         handle.seek(0)
-        dialect = csv.Sniffer().sniff(sample, delimiters=",\t") if sample else "excel"
-        reader = csv.DictReader(handle, dialect=dialect)
+        reader = (
+            csv.DictReader(
+                handle, dialect=csv.Sniffer().sniff(sample, delimiters=",\t")
+            )
+            if sample
+            else csv.DictReader(handle)
+        )
         return [
             {k.strip().lower(): (v.strip() if isinstance(v, str) else v)
              for k, v in row.items() if k}
@@ -192,7 +197,7 @@ def parse_manifest(path: Path | str) -> List[BatchJob]:
             id=job_id,
             params=build_job_params({**row, "id": job_id}, path.parent),
             models=parse_models(row.get("models")),
-            n_models=int(n_models) if n_models not in (None, "") else None,
+            n_models=int(str(n_models)) if n_models not in (None, "") else None,
         ))
     if not jobs:
         raise ManifestError(f"No jobs in {path}")
