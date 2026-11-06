@@ -1,10 +1,12 @@
 """GPU selection relative to the GPUs this process was given."""
 
 import os
-from typing import Mapping, Optional
+from typing import Dict, Mapping, Optional
 
 
-def to_physical(gpus: Optional[str], environ: Optional[Mapping] = None) -> Optional[str]:
+def to_physical(
+    gpus: Optional[str], environ: Optional[Mapping] = None
+) -> Optional[str]:
     """Translate ``--gpus`` indices into ids for a child ``CUDA_VISIBLE_DEVICES``.
 
     ``--gpus 0`` means the first GPU *visible to ABCFold*. Setting
@@ -38,8 +40,11 @@ def to_physical(gpus: Optional[str], environ: Optional[Mapping] = None) -> Optio
     return ",".join(out)
 
 
-def docker_gpu_flags(gpus: Optional[str], environ: Optional[Mapping] = None) -> list:
-    """``docker run --gpus`` flags; docker sees host GPUs, so physical ids are needed."""
+def docker_gpu_flags(
+    gpus: Optional[str], environ: Optional[Mapping] = None
+) -> list:
+    """``docker run --gpus`` flags; docker sees host GPUs, so physical ids are
+    needed."""
     if gpus is not None and str(gpus).strip().lower() == "cpu":
         return []
     environ = os.environ if environ is None else environ
@@ -47,3 +52,14 @@ def docker_gpu_flags(gpus: Optional[str], environ: Optional[Mapping] = None) -> 
     if physical is None:
         physical = environ.get("CUDA_VISIBLE_DEVICES")
     return ["--gpus", f"device={physical}"] if physical else ["--gpus", "all"]
+
+
+def cuda_env(
+    gpus: Optional[str], environ: Optional[Mapping] = None
+) -> Dict[str, str]:
+    """Child environment pinning a backend to the ``--gpus`` selection.
+
+    Empty for "all"/None, so the child inherits the parent mask unchanged.
+    """
+    physical = to_physical(gpus, environ)
+    return {} if physical is None else {"CUDA_VISIBLE_DEVICES": physical}

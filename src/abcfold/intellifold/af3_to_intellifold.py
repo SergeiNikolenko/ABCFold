@@ -3,6 +3,8 @@ import logging
 from pathlib import Path
 from typing import Dict, Union
 
+from abcfold.alphafold3.af3_adapter import prepare_inference_input
+
 logger = logging.getLogger("logger")
 
 # IntelliFold v2 runs a vendored AlphaFold 3 JAX engine, so it reads the AF3
@@ -17,9 +19,10 @@ class Intellifoldjson:
     Object to convert an AlphaFold3 json file to an IntelliFold JSON file.
 
     IntelliFold v2 consumes the AlphaFold 3 dialect, so this normalises the
-    input rather than remapping it: seeds are collected, and any chain carrying
-    an unpaired alignment gets an explicit empty ``pairedMsa`` so the engine
-    does not attempt its own pairing.
+    input rather than remapping it. The engine always runs with its data
+    pipeline off (ABCFold resolves alignments itself), and AlphaFold 3 then
+    requires every protein and RNA chain to carry explicit MSA and template
+    fields: a chain without an alignment is folded from its single sequence.
     """
 
     def __init__(self, working_dir: Union[str, Path], create_files: bool = True):
@@ -62,19 +65,13 @@ class Intellifoldjson:
         self.seeds = seeds
         intellifold_dict["modelSeeds"] = seeds
 
-        for entry in intellifold_dict.get("sequences", []):
-            for key in ("protein", "rna"):
-                if key not in entry:
-                    continue
-                chain = entry[key]
-                if chain.get("unpairedMsa") or chain.get("unpairedMsaPath"):
-                    self.uses_msa = True
-                    # An explicit empty pairedMsa is required whenever
-                    # unpairedMsa is set by hand.
-                    if key == "protein" and not chain.get("pairedMsaPath"):
-                        chain["pairedMsa"] = chain.get("pairedMsa", "")
-            if "protein" in entry:
-                entry["protein"].setdefault("templates", [])
+        self.uses_msa = any(
+            entry[key].get("unpairedMsa") or entry[key].get("unpairedMsaPath")
+            for entry in intellifold_dict.get("sequences", [])
+            for key in ("protein", "rna")
+            if key in entry
+        )
+        intellifold_dict = prepare_inference_input(intellifold_dict)
 
         intellifold_dict["dialect"] = AF3_DIALECT
         intellifold_dict["version"] = max(

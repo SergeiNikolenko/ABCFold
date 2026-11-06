@@ -109,11 +109,17 @@ def test_af3_to_intellifold(test_data):
         assert data["version"] >= 2
         assert data["name"] == "2PV7"
         assert intellifold_json.seeds == [1]
+        assert intellifold_json.uses_msa is False
         # IntelliFold reads the AlphaFold3 dialect, so entities are passed
-        # through with an empty template list added to each protein
+        # through. Its data pipeline is always off, and AlphaFold3 then needs
+        # explicit MSA and template fields: a chain without an alignment is
+        # folded from its single sequence.
         for converted, source in zip(data["sequences"], original["sequences"]):
             if "protein" in converted:
-                assert converted["protein"].pop("templates") == []
+                protein = converted["protein"]
+                assert protein.pop("unpairedMsa") == ""
+                assert protein.pop("pairedMsa") == ""
+                assert protein.pop("templates") == []
             assert converted == source
 
 
@@ -187,3 +193,49 @@ def test_af3_to_esmfold2_msa(test_data):
         msa_path = Path(data["sequences"][0]["msa_path"])
         assert msa_path.exists()
         assert msa_path.read_text().startswith(">")
+
+
+def test_intellifold_command_flags():
+    from abcfold.intellifold.run_intellifold import \
+        generate_intellifold_command
+
+    cmd = generate_intellifold_command(
+        "in.json", "out", "/weights", number_of_models=3, num_recycles=7
+    )
+
+    # Flags after the bare "--" go to the vendored AlphaFold3 engine
+    engine_flags = cmd[cmd.index("--") + 1:]
+    assert "--num_diffusion_samples=3" in engine_flags
+    assert "--num_recycles=7" in engine_flags
+    # The engine's own search would need the AlphaFold3 databases
+    assert "--norun_data_pipeline" in engine_flags
+    assert "--force_output_dir" in engine_flags
+
+
+def test_opendde_command_flags():
+    from abcfold.opendde.run_opendde import generate_opendde_command
+
+    cmd = generate_opendde_command(
+        "in.json", "out", {"opendde_model": None}, number_of_models=3,
+        seeds=[1, 2], use_msa=False, num_recycles=7,
+    )
+
+    def value(flag):
+        return cmd[cmd.index(flag) + 1]
+
+    assert value("-n") == "opendde_v1"
+    assert value("--seeds") == "1,2"
+    assert value("--sample") == "3"
+    assert value("--cycle") == "7"
+    # --use_msa defaults to true and would start a ColabFold search
+    assert value("--use_msa") == "false"
+
+
+def test_cuda_env_follows_the_inherited_mask():
+    from abcfold.gpus import cuda_env
+
+    environ = {"CUDA_VISIBLE_DEVICES": "2,5"}
+
+    assert cuda_env("1", environ) == {"CUDA_VISIBLE_DEVICES": "5"}
+    assert cuda_env("all", environ) == {}
+    assert cuda_env(None, environ) == {}

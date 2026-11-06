@@ -603,6 +603,8 @@ def _run_intellifold(args, rt_config, run_json, input_params, name):
         output_dir=args.output_dir,
         save_input=args.save_input,
         number_of_models=args.number_of_models,
+        num_recycles=args.num_recycles,
+        gpus=args.gpus,
         config=rt_config,
     )
     if not ok:
@@ -621,6 +623,8 @@ def _run_opendde(args, rt_config, run_json, input_params, name):
         output_dir=args.output_dir,
         save_input=args.save_input,
         number_of_models=args.number_of_models,
+        num_recycles=args.num_recycles,
+        gpus=args.gpus,
         config=rt_config,
     )
     if not ok:
@@ -639,6 +643,7 @@ def _run_esmfold2(args, rt_config, run_json, input_params, name):
         output_dir=args.output_dir,
         save_input=args.save_input,
         number_of_models=args.number_of_models,
+        gpus=args.gpus,
         config=rt_config,
     )
     if not ok:

@@ -13,6 +13,7 @@ from jinja2 import Environment, FileSystemLoader
 from abcfold.output.alphafold3 import AlphafoldOutput
 from abcfold.output.boltz import BoltzOutput
 from abcfold.output.chai import ChaiOutput
+from abcfold.output.cofolding_common import SeedSampleOutput
 from abcfold.output.file_handlers import ConfidenceJsonFile, NpzFile
 from abcfold.output.openfold3 import OpenfoldOutput
 from abcfold.output.protenix import ProtenixOutput
@@ -299,6 +300,11 @@ def get_all_cif_files(outputs) -> Dict[str, list]:
                 if "RosettaFold3" not in method_cif_objs:
                     method_cif_objs["RosettaFold3"] = []
                 method_cif_objs["RosettaFold3"].extend(output.cif_files[seed])
+        elif isinstance(output, SeedSampleOutput):
+            for seed in output.seeds:
+                method_cif_objs.setdefault(output.display_name, []).extend(
+                    output.cif_files[seed]
+                )
 
     return method_cif_objs
 

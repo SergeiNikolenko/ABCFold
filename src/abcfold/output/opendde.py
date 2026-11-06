@@ -15,6 +15,7 @@ class OpenDDEOutput(SeedSampleOutput):
 
     results_prefix = "opendde_results"
     label = "opendde"
+    display_name = "OpenDDE"
     sample_token = "_sample_"
     plddt_is_fraction = False
 

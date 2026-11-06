@@ -2,10 +2,12 @@ import logging
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
+from abcfold.gpus import cuda_env
 from abcfold.intellifold.af3_to_intellifold import Intellifoldjson
 from abcfold.intellifold.check_install import ensure_intellifold_env
+from abcfold.output.cofolding_common import input_dir_for
 
 logger = logging.getLogger("logger")
 
@@ -17,6 +19,8 @@ def run_intellifold(
     save_input: bool = False,
     test: bool = False,
     number_of_models: int = 5,
+    num_recycles: int = 10,
+    gpus: Optional[str] = "all",
 ) -> bool:
     """
     Run IntelliFold using the input JSON file
@@ -29,6 +33,9 @@ def run_intellifold(
         directory
         test (bool): If True, run the test command
         number_of_models (int): Number of models to generate
+        num_recycles (int): Number of trunk recycles
+        gpus (Optional[str]): ``--gpus`` selection, mapped through the inherited
+        CUDA_VISIBLE_DEVICES mask
 
     Returns:
         Bool: True if the IntelliFold run was successful, False otherwise
@@ -55,7 +62,7 @@ def run_intellifold(
         working_dir = Path(temp_dir)
         if save_input:
             logger.info("Saving msa to the output directory")
-            working_dir = output_dir
+            working_dir = input_dir_for(output_dir, "intellifold")
             working_dir.mkdir(parents=True, exist_ok=True)
 
         intellifold_json = Intellifoldjson(working_dir)
@@ -72,21 +79,21 @@ def run_intellifold(
                 intellifold_out_dir,
                 model_dir,
                 number_of_models,
-                run_data_pipeline=not intellifold_json.uses_msa,
+                num_recycles=num_recycles,
             )
             if not test
             else generate_intellifold_test_command()
         )
 
         try:
-            env.run(cmd)
+            env.run(cmd, extra_env=cuda_env(gpus))
         except subprocess.CalledProcessError as e:
             stderr = e.stderr or ""
             if stderr:
-                if working_dir.exists():
-                    output_err_file = working_dir / "intellifold_error.log"
-                else:
-                    output_err_file = working_dir.parent / "intellifold_error.log"
+                # The working directory is temporary unless --save_input is
+                # set, so the log goes next to the results where it survives.
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output_err_file = output_dir / "intellifold_error.log"
                 output_err_file.write_text(stderr)
                 logger.error(
                     "IntelliFold run failed. Error log is in %s", output_err_file
@@ -105,7 +112,7 @@ def generate_intellifold_command(
     output_dir: Union[str, Path],
     model_dir: Union[str, Path],
     number_of_models: int = 5,
-    run_data_pipeline: bool = False,
+    num_recycles: int = 10,
 ) -> list:
     """
     Generate the IntelliFold command
@@ -113,19 +120,20 @@ def generate_intellifold_command(
     Seeds are not a command line flag: the vendored AlphaFold 3 engine reads
     them from ``modelSeeds`` in the input JSON and runs once per seed.
     Everything after the bare ``--`` is forwarded verbatim to the engine's
-    absl flags.
+    absl flags. The engine's data pipeline stays off: it would need the
+    AlphaFold 3 databases, and ABCFold has already resolved the alignments.
 
     Args:
         input_json (Union[str, Path]): Path to the input JSON file
         output_dir (Union[str, Path]): Path to the output directory
         model_dir (Union[str, Path]): Path to the model weights directory
         number_of_models (int): Number of diffusion samples to generate
-        run_data_pipeline (bool): If True, let the engine search for alignments
+        num_recycles (int): Number of trunk recycles
 
     Returns:
         list: The IntelliFold command
     """
-    cmd = [
+    return [
         "intellifold",
         "predict",
         str(input_json),
@@ -133,15 +141,13 @@ def generate_intellifold_command(
         f"--output-dir={output_dir}",
         "--",
         f"--num_diffusion_samples={number_of_models}",
+        f"--num_recycles={num_recycles}",
         # Without this the engine appends a timestamp when the output
         # directory already exists, which breaks output collection.
         "--force_output_dir",
+        "--norun_data_pipeline",
+        "--resolve_msa_overlaps=false",
     ]
-
-    if not run_data_pipeline:
-        cmd.extend(["--norun_data_pipeline", "--resolve_msa_overlaps=false"])
-
-    return cmd
 
 
 def generate_intellifold_test_command() -> list:
