@@ -3,6 +3,7 @@
 import logging
 import shutil
 import subprocess
+import sys
 from multiprocessing import Process
 from pathlib import Path
 from typing import Dict, List, Union
@@ -364,7 +365,10 @@ def get_pae_run_script(
     labels_string = ";".join(labels)
     # labels_string = rf'"{labels_string}"'
 
-    cmd.append("python")
+    # The helper needs ABCFold's own dependencies, so run it with the
+    # interpreter ABCFold is installed in rather than whatever `python` on
+    # PATH happens to be.
+    cmd.append(sys.executable)
     cmd.append(str(PAEVIEWER.resolve()))
     cmd.append("--structure")
     cmd.append(str(cif_path.resolve()))
@@ -392,7 +396,7 @@ def get_template_run_script(
     output_file = Path(output_file)
     src_path = Path(src_path)
     cmd = []
-    cmd.append("python")
+    cmd.append(sys.executable)
     cmd.append(str(CREATETEMPLATE.resolve()))
     cmd.append("--title")
     # title = rf'"{title}"'

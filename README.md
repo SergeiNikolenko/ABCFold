@@ -175,6 +175,62 @@ If you had multiple IDs in your input sequence, multiple template files and you 
 uv run abcfold <input_json> <output_dir> -abcop --mmseqs2 --custom_template custom_a.pdb custom_b.pdb custom_c.pdb --custom_template_chain A B B --target_id A A B
 
 ```
+### Backend environments and containers
+
+Each backend lives in its own micromamba environment, pinned in `backends.toml`
+and built with `abcfold envs build [backend ...]`. `abcfold envs show` lists the
+pins, `abcfold envs check` verifies an environment without modifying it.
+
+A GPU backend environment is 6-7 GB, and almost all of it is PyTorch and the
+CUDA wheels it depends on (about 4 GB of `nvidia-*` plus 1.5-1.8 GB of torch).
+Those cannot be trimmed: `libtorch_cuda.so` links `libnccl.so.2`,
+`libcusparseLt.so.0` and `libnvshmem_host.so.3` at load time, so removing
+`nvidia-nccl-cu12`, `nvidia-cusparselt-cu12` or `nvidia-nvshmem-cu12` makes
+`import torch` fail even for a single-GPU prediction. The JAX engine behind
+IntelliFold does load its collectives lazily, so that environment drops NCCL
+and nvSHMEM (about 870 MB) and still sees every GPU. Each backend's `strip`
+list is guarded by a `smoke` import, so a build that breaks an environment
+fails at build time instead of mid-prediction; `--keep-unused` skips stripping.
+
+ABCFold reduces the footprint in two ways that do not touch what a backend
+loads:
+
+- The uv wheel cache is placed next to the environments during a build. uv
+  hardlinks wheel files from its cache, but a hardlink cannot cross a
+  filesystem boundary: with the default `~/.cache/uv` on another mount, uv
+  silently copies, and every backend gets its own copy of every wheel.
+- `abcfold envs dedupe` hardlinks byte-identical files across all backend
+  environments, which also fixes environments built before this. On a three
+  backend install it reclaims about 1 GB (the `alphafold3` wheel alone ships
+  the same 525 MB `components.cif` twice).
+
+Model weights are downloaded only for the backends you actually request, and
+the `[paths]` settings keep them out of the environments: `boltz_weights`,
+`openfold_weights`, `rosettafold_weights`, `intellifold_weights`,
+`protenix_root_dir`, `opendde_root_dir`, `esmfold2_weights` (the Hugging Face
+cache root) and `chai_downloads_dir`. Point them at shared storage and several
+hosts and environments use one copy.
+
+For a container instead of a local environment, `abcfold envs image <backend>`
+writes an Apptainer definition (or `--recipe docker` for a Dockerfile) built
+from the same pins, so a containerised run executes the same versions as a
+local one. Add `--build` to build it immediately:
+
+```bash
+abcfold envs image opendde --output-dir containers --build
+```
+
+Then point the backend at the image in your config file:
+
+```toml
+[backends.opendde]
+image = "containers/abcfold-opendde-1.2.0.sif"
+```
+
+ABCFold mounts the working directory and the configured weight and cache
+directories into the container and passes the GPU through (`--nv` for
+Apptainer, `--gpus` for Docker).
+
 ### Output
 
 ABCFold will output the AlphaFold, Boltz, Chai, OpenFold3, Protenix, RosettaFold3, IntelliFold, OpenDDE and ESMFold2 models in the `<output_dir>`, it will also produce an output page containing a results table and informative [PAE viewer](https://gitlab.gwdg.de/general-microbiology/pae-viewer). This is opened automatically in your default browser unless the `--no_server` or `--no_visuals` flags are used.

@@ -98,10 +98,18 @@ def run_esmfold2(
         esmfold2_out_dir.mkdir(parents=True, exist_ok=True)
         logger.info("Running ESMFold2 using seeds: %s", esmfold2_json.seeds)
 
+        extra_env = cuda_env(gpus)
+        weights = config.get("esmfold2_weights")
+        if weights:
+            # ESMFold2 pulls its weights from Hugging Face. Pointing the cache
+            # at one directory keeps the ~10 GB download out of every new
+            # environment and lets several hosts share it.
+            extra_env["HF_HOME"] = str(Path(str(weights)).expanduser())
+
         try:
             env.run(
                 generate_esmfold2_command(out_file, esmfold2_out_dir, options_file),
-                extra_env=cuda_env(gpus),
+                extra_env=extra_env,
             )
         except subprocess.CalledProcessError as e:
             stderr = e.stderr or ""
