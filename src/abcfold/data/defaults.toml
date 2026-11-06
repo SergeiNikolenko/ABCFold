@@ -14,6 +14,10 @@ openfold_weights = ""
 rosettafold_weights = ""
 intellifold_weights = ""
 protenix_root_dir = ""
+# OpenDDE checkpoints and its template/search assets (default ~/.cache/opendde)
+opendde_root_dir = ""
+# ESMFold2 weights come from Hugging Face; this is its cache root
+esmfold2_weights = ""
 # Shared across Chai envs so a new env does not re-download ~6.5 GB of weights
 chai_downloads_dir = "~/.cache/abcfold/chai"
 # Local PDB mmCIF mirror used for template structures (OpenFold3)
@@ -45,3 +49,8 @@ af3_docker_env = "romerolabduke/alphafast:latest"
 [runtime]
 # Build a missing backend env on first use (never modifies an existing env)
 build_missing_envs = false
+# Remove the wheels a backend's pins mark as unused when building an env. Only
+# the JAX backend has any: the PyTorch CUDA libraries are load-time
+# dependencies of libtorch_cuda and are kept regardless (see backends.toml).
+# `abcfold envs build --keep-unused` overrides it per build.
+strip_unused_wheels = true

@@ -80,8 +80,15 @@ def run_opendde(
             else generate_opendde_test_command()
         )
 
+        extra_env = cuda_env(gpus)
+        root_dir = config.get("opendde_root_dir")
+        if root_dir:
+            # Checkpoints and the template assets land here instead of
+            # ~/.cache/opendde, so environments and hosts can share them.
+            extra_env["OPENDDE_ROOT_DIR"] = str(Path(str(root_dir)).expanduser())
+
         try:
-            env.run(cmd, extra_env=cuda_env(gpus))
+            env.run(cmd, extra_env=extra_env)
         except subprocess.CalledProcessError as e:
             stderr = e.stderr or ""
             if stderr:

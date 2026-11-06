@@ -10,6 +10,22 @@
 
 schema = 1
 
+# `strip` lists wheels an environment can be built without, and `smoke` is the
+# import that proves it still works. Measured on 4x H100 (2026-11-06): the
+# PyTorch CUDA wheels cannot be slimmed this way at all. libtorch_cuda.so has
+# DT_NEEDED entries for libnccl.so.2, libcusparseLt.so.0 and
+# libnvshmem_host.so.3, so removing any of nvidia-nccl-cu12,
+# nvidia-cusparselt-cu12 or nvidia-nvshmem-cu12 makes `import torch` fail even
+# for a single-GPU prediction; the torch backends therefore strip nothing. The
+# JAX engine behind IntelliFold loads its collectives lazily and runs on all
+# GPUs without them, which is the one case where stripping pays (~870 MB).
+# triton is never stripped: the ESMFold2 and OpenDDE kernels import it.
+#
+# The environments share disk instead: uv hardlinks wheel files from its cache,
+# and `abcfold envs build` points that cache at the environment root so the
+# links can be made (see `shared_cache_env`). `abcfold envs dedupe` collapses
+# environments that were built before this, and `--keep-unused` skips stripping.
+
 [boltz]
 package = "boltz"
 version = "2.2.1"
@@ -17,6 +33,7 @@ python = "3.11"
 env = "abcfold2-boltz"
 pip = ["boltz[cuda]==2.2.1"]
 torch_backend = "cu128"
+smoke = ["torch", "boltz"]
 
 [chai1]
 package = "chai_lab"
@@ -30,6 +47,7 @@ torch_backend = "cu128"
 # chai_lab 0.6.1 declares torch<2.7, but no torch<2.7 wheel supports Blackwell
 # (sm_120). Chai-1 runs correctly on torch 2.11 (validated on the KRAS fixture).
 overrides = ["torch==2.11.0"]
+smoke = ["torch", "chai_lab"]
 
 [protenix]
 package = "protenix"
@@ -43,6 +61,7 @@ torch_backend = "cu128"
 # protenix-v2 weights are not public (the official URL returns 403); v1.0.0 is
 # the newest public checkpoint and runs on the 2.0.0 code.
 model = "protenix_base_default_v1.0.0"
+smoke = ["torch", "protenix"]
 
 [openfold3]
 package = "openfold3"
@@ -53,6 +72,7 @@ pip = ["openfold3[cuequivariance]==0.5.0"]
 conda = ["kalign2"]
 torch_backend = "cu128"
 checkpoint = "openbind-2025-06-30-174k"
+smoke = ["torch", "openfold3"]
 
 [rosettafold3]
 package = "rc-foundry"
@@ -60,6 +80,7 @@ version = "0.1.12"
 python = "3.12"
 env = "abcfold2-rosettafold3"
 pip = ["rc-foundry[rf3]==0.1.12"]
+smoke = ["torch"]
 
 [intellifold]
 package = "intellifold"
@@ -73,6 +94,11 @@ torch_backend = "cu128"
 # `pip install ./third_party/alphafold3 && build_data` from the IntelliFold
 # checkout. ABCFold reports the missing engine instead of failing mid-run.
 engine_package = "alphafold3"
+strip = [
+    "nvidia-nccl-cu12",
+    "nvidia-nvshmem-cu12",
+]
+smoke = ["intellifold", "alphafold3", "jax"]
 
 [opendde]
 package = "opendde"
@@ -82,6 +108,7 @@ env = "abcfold2-opendde"
 pip = ["opendde[gpu]==1.2.0"]
 torch_backend = "cu128"
 model = "opendde_v1"
+smoke = ["torch", "opendde", "triton"]
 
 [esmfold2]
 package = "esm"
@@ -94,6 +121,7 @@ torch_backend = "cu128"
 # inside this environment. Weights come from the Hugging Face repo below.
 model = "biohub/ESMFold2"
 device = "cuda"
+smoke = ["torch", "esm.models.esmfold2", "triton"]
 
 [alphafold3]
 # AlphaFold 3 runs through an external container/command (see `abcfold run
