@@ -87,7 +87,8 @@ def msa_argparse_util(parser):
     )
     parser.add_argument(
         "--msa_server_url",
-        help="[optional] ColabFold MMseqs2 API URL (default: https://api.colabfold.com)",
+        help=dedent("[optional] ColabFold MMseqs2 API URL \
+        (default: https://api.colabfold.com)"),
     )
     parser.add_argument(
         "--min_msa_rows",
