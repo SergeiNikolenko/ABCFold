@@ -57,6 +57,9 @@ def plot_plddt(
         "Protenix": px.colors.qualitative.Set3,
         "OpenFold3": px.colors.qualitative.Alphabet,
         "RosettaFold3": px.colors.qualitative.Dark24,
+        "IntelliFold": px.colors.qualitative.Pastel,
+        "OpenDDE": px.colors.qualitative.Bold,
+        "ESMFold2": px.colors.qualitative.Safe,
     }
 
     line_ranges: dict = {}

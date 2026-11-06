@@ -2,10 +2,12 @@ import logging
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
+from abcfold.gpus import cuda_env
 from abcfold.opendde.af3_to_opendde import OpenDDEjson
 from abcfold.opendde.check_install import ensure_opendde_env
+from abcfold.output.cofolding_common import input_dir_for
 
 logger = logging.getLogger("logger")
 
@@ -19,6 +21,8 @@ def run_opendde(
     save_input: bool = False,
     test: bool = False,
     number_of_models: int = 5,
+    num_recycles: int = 10,
+    gpus: Optional[str] = "all",
 ) -> bool:
     """
     Run OpenDDE using the input JSON file
@@ -31,6 +35,9 @@ def run_opendde(
         directory
         test (bool): If True, run the test command
         number_of_models (int): Number of models to generate
+        num_recycles (int): Number of Pairformer cycles
+        gpus (Optional[str]): ``--gpus`` selection, mapped through the inherited
+        CUDA_VISIBLE_DEVICES mask
 
     Returns:
         Bool: True if the OpenDDE run was successful, False otherwise
@@ -48,7 +55,7 @@ def run_opendde(
         working_dir = Path(temp_dir)
         if save_input:
             logger.info("Saving msa to the output directory")
-            working_dir = output_dir
+            working_dir = input_dir_for(output_dir, "opendde")
             working_dir.mkdir(parents=True, exist_ok=True)
 
         opendde_json = OpenDDEjson(working_dir)
@@ -67,20 +74,21 @@ def run_opendde(
                 number_of_models,
                 opendde_json.seeds,
                 use_msa=opendde_json.uses_msa,
+                num_recycles=num_recycles,
             )
             if not test
             else generate_opendde_test_command()
         )
 
         try:
-            env.run(cmd)
+            env.run(cmd, extra_env=cuda_env(gpus))
         except subprocess.CalledProcessError as e:
             stderr = e.stderr or ""
             if stderr:
-                if working_dir.exists():
-                    output_err_file = working_dir / "opendde_error.log"
-                else:
-                    output_err_file = working_dir.parent / "opendde_error.log"
+                # The working directory is temporary unless --save_input is
+                # set, so the log goes next to the results where it survives.
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output_err_file = output_dir / "opendde_error.log"
                 output_err_file.write_text(stderr)
                 logger.error(
                     "OpenDDE run failed. Error log is in %s", output_err_file
@@ -101,6 +109,7 @@ def generate_opendde_command(
     number_of_models: int = 5,
     seeds: Union[list, None] = None,
     use_msa: bool = False,
+    num_recycles: int = 10,
 ) -> list:
     """
     Generate the OpenDDE command
@@ -112,6 +121,7 @@ def generate_opendde_command(
         number_of_models (int): Number of samples to generate per seed
         seeds (list): Random seeds to use for the OpenDDE run
         use_msa (bool): If True, the converted input carries MSA paths
+        num_recycles (int): Number of Pairformer cycles
 
     Returns:
         list: The OpenDDE command
@@ -134,6 +144,8 @@ def generate_opendde_command(
         ",".join(str(seed) for seed in seeds),
         "--sample",
         str(number_of_models),
+        "--cycle",
+        str(num_recycles),
         "--use_msa",
         "true" if use_msa else "false",
         "--use_template",

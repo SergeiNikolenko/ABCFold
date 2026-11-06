@@ -64,6 +64,12 @@ Vue.component('abc-table', {
                     return 'btn-source5';
                 case 'RosettaFold3':
                     return 'btn-source6';
+                case 'IntelliFold':
+                    return 'btn-source7';
+                case 'OpenDDE':
+                    return 'btn-source8';
+                case 'ESMFold2':
+                    return 'btn-source9';
                 default:
                     return 'btn-default';
             }

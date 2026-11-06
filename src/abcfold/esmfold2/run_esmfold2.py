@@ -3,10 +3,12 @@ import logging
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 from abcfold.esmfold2.af3_to_esmfold2 import Esmfold2json
 from abcfold.esmfold2.check_install import ensure_esmfold2_env
+from abcfold.gpus import cuda_env
+from abcfold.output.cofolding_common import input_dir_for
 
 logger = logging.getLogger("logger")
 
@@ -25,6 +27,7 @@ def run_esmfold2(
     save_input: bool = False,
     test: bool = False,
     number_of_models: int = 5,
+    gpus: Optional[str] = "all",
 ) -> bool:
     """
     Run ESMFold2 using the input JSON file
@@ -40,6 +43,8 @@ def run_esmfold2(
         directory
         test (bool): If True, run the test command
         number_of_models (int): Number of models to generate
+        gpus (Optional[str]): ``--gpus`` selection, mapped through the inherited
+        CUDA_VISIBLE_DEVICES mask
 
     Returns:
         Bool: True if the ESMFold2 run was successful, False otherwise
@@ -66,7 +71,7 @@ def run_esmfold2(
         working_dir = Path(temp_dir)
         if save_input:
             logger.info("Saving msa to the output directory")
-            working_dir = output_dir
+            working_dir = input_dir_for(output_dir, "esmfold2")
             working_dir.mkdir(parents=True, exist_ok=True)
 
         esmfold2_json = Esmfold2json(working_dir)
@@ -95,15 +100,16 @@ def run_esmfold2(
 
         try:
             env.run(
-                generate_esmfold2_command(out_file, esmfold2_out_dir, options_file)
+                generate_esmfold2_command(out_file, esmfold2_out_dir, options_file),
+                extra_env=cuda_env(gpus),
             )
         except subprocess.CalledProcessError as e:
             stderr = e.stderr or ""
             if stderr:
-                if working_dir.exists():
-                    output_err_file = working_dir / "esmfold2_error.log"
-                else:
-                    output_err_file = working_dir.parent / "esmfold2_error.log"
+                # The working directory is temporary unless --save_input is
+                # set, so the log goes next to the results where it survives.
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output_err_file = output_dir / "esmfold2_error.log"
                 output_err_file.write_text(stderr)
                 logger.error(
                     "ESMFold2 run failed. Error log is in %s", output_err_file
