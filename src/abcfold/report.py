@@ -13,7 +13,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 import numpy as np
 
 SCHEMA = "cofolding-report-v2"
-ENGINES = ("alphafold3", "boltz", "chai1", "protenix", "openfold3", "rosettafold3")
+ENGINES = ("alphafold3", "boltz", "chai1", "protenix", "openfold3",
+           "rosettafold3", "intellifold", "opendde", "esmfold2")
 STATUSES = ("ok", "failed", "skipped")
 
 # Score keys in order of preference; the first one present is the engine's

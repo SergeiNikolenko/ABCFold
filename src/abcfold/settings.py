@@ -34,6 +34,9 @@ BACKEND_NAMES = (
     "protenix",
     "openfold3",
     "rosettafold3",
+    "intellifold",
+    "opendde",
+    "esmfold2",
     "alphafold3",
 )
 
@@ -44,6 +47,9 @@ LEGACY_ENV_KEYS = {
     "protenix_env": "protenix",
     "openfold_env": "openfold3",
     "rosettafold_env": "rosettafold3",
+    "intellifold_env": "intellifold",
+    "opendde_env": "opendde",
+    "esmfold2_env": "esmfold2",
 }
 LEGACY_VERSION_KEYS = {
     "boltz_version": "boltz",
@@ -51,6 +57,9 @@ LEGACY_VERSION_KEYS = {
     "protenix_version": "protenix",
     "openfold_version": "openfold3",
     "rosetta_version": "rosettafold3",
+    "intellifold_version": "intellifold",
+    "opendde_version": "opendde",
+    "esmfold2_version": "esmfold2",
     "af3_version": "alphafold3",
 }
 
@@ -168,6 +177,9 @@ class Settings:
         cfg["openfold_checkpoint"] = self.backends.get("openfold3", {}).get(
             "checkpoint"
         )
+        cfg["opendde_model"] = self.backends.get("opendde", {}).get("model")
+        cfg["esmfold2_model"] = self.backends.get("esmfold2", {}).get("model")
+        cfg["esmfold2_device"] = self.backends.get("esmfold2", {}).get("device")
         cfg["_settings"] = self
         return cfg
 
