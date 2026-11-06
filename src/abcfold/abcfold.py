@@ -18,8 +18,8 @@ from abcfold.argparse_utils import (alphafold_argparse_util,
                                     esmfold2_argparse_util,
                                     intellifold_argparse_util,
                                     main_argpase_util, mmseqs2_argparse_util,
-                                    msa_argparse_util, openfold_argparse_util,
-                                    opendde_argparse_util,
+                                    msa_argparse_util, opendde_argparse_util,
+                                    openfold_argparse_util,
                                     prediction_argparse_util,
                                     protenix_argparse_util,
                                     raise_argument_errors,
@@ -698,7 +698,7 @@ def render_html(outputs: List[Tuple[str, ModelOutput]], output_dir: Path,
     prefix_by_display = {DISPLAY_NAMES[e]: MODEL_PREFIX[e] for e in DISPLAY_NAMES}
     models_dir = output_dir.joinpath("output_models")
     models_dir.mkdir(parents=True, exist_ok=True)
-    output_models = []
+    output_models: List[Union[str, Path]] = []
     for model in combined_models:
         cif_file = output_dir.joinpath(model["model_path"])
         out_name = (f"{prefix_by_display[model['model_source']]}_model_"

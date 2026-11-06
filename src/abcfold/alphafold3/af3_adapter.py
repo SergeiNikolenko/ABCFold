@@ -9,7 +9,6 @@ be run separately: ``data_pipeline`` writes ``<name>/<name>_data.json``, which
 
 from __future__ import annotations
 
-from abcfold.gpus import docker_gpu_flags, to_physical
 import copy
 import csv
 import json
@@ -22,6 +21,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
+
+from abcfold.gpus import docker_gpu_flags, to_physical
 
 logger = logging.getLogger("logger")
 
@@ -166,10 +167,10 @@ def build_af3_command(
         (str(output_dir), CONTAINER_OUTPUT_DIR, False),
     ]
     if needs_models:
-        mounts.append((str(Path(cfg.model_dir).expanduser().resolve()),
+        mounts.append((str(Path(str(cfg.model_dir)).expanduser().resolve()),
                        CONTAINER_MODEL_DIR, True))
     if needs_dbs:
-        mounts.append((str(Path(cfg.db_dir).expanduser().resolve()),
+        mounts.append((str(Path(str(cfg.db_dir)).expanduser().resolve()),
                        CONTAINER_DB_DIR, True))
 
     flags = af3_flags(

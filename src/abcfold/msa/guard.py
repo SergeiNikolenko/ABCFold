@@ -25,7 +25,7 @@ def min_msa_rows(config: Optional[Mapping] = None) -> int:
     value = (config or {}).get("min_msa_rows")
     if value in (None, "", "None"):
         return MIN_MSA_ROWS
-    return int(value)
+    return int(str(value))
 
 
 def msa_rows(unpaired: Optional[str], paired: Optional[str] = None) -> int:

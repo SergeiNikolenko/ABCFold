@@ -69,10 +69,10 @@ def normalise_plddt(plddt):
 
 
 def main():
-    description_path, output_dir, options_path = sys.argv[1:4]
+    description_path, output_arg, options_path = sys.argv[1:4]
     description = json.loads(Path(description_path).read_text())
     options = json.loads(Path(options_path).read_text())
-    output_dir = Path(output_dir)
+    output_dir = Path(output_arg)
 
     import esm.models.esmfold2 as esm_mod
     from esm.models.esmfold2 import ESMFold2InputBuilder, EsmFold2Model

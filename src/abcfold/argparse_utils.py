@@ -560,7 +560,9 @@ def raise_argument_errors(args):
         logger.error("--msa custom requires --msa_a3m")
         sys.exit(1)
 
-    if getattr(args, "msa", "auto") == "af3" and not getattr(args, "af3_data_json", None):
+    if getattr(args, "msa", "auto") == "af3" and not getattr(
+        args, "af3_data_json", None
+    ):
         logger.error("--msa af3 requires --af3_data_json")
         sys.exit(1)
 
