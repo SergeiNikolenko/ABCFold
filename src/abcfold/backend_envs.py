@@ -339,7 +339,10 @@ def _recipe_steps(spec: "BackendEnvSpec", strip: bool = True) -> List[str]:
         + " ".join(conda),
         "/opt/abcfold/bin/python -m pip install --no-cache-dir uv",
     ]
-    install = "/opt/abcfold/bin/uv pip install --python /opt/abcfold/bin/python"
+    # --no-cache: a wheel cache inside the image would double the CUDA wheels
+    # (about 4 GB) in the layer that creates them.
+    install = ("/opt/abcfold/bin/uv pip install --no-cache "
+               "--python /opt/abcfold/bin/python")
     if spec.torch_backend:
         install += f" --torch-backend {spec.torch_backend}"
     if spec.overrides:
@@ -348,15 +351,19 @@ def _recipe_steps(spec: "BackendEnvSpec", strip: bool = True) -> List[str]:
             + " > /tmp/overrides.txt"
         )
         install += " --override /tmp/overrides.txt"
-    steps.append(install + " " + " ".join(spec.pip))
+    # Quoted: extras like opendde[gpu] are glob syntax to the shell.
+    steps.append(install + " " + " ".join(f"'{p}'" for p in spec.pip))
+    # Tolerant: uninstalling a package that was never pulled in is not an
+    # error, but the recipe runs under `set -e`.
     steps.append(
         "/opt/abcfold/bin/uv pip uninstall --python /opt/abcfold/bin/python "
-        + " ".join(remove)
+        + " ".join(remove) + " || true"
     )
     steps.append("/opt/abcfold/bin/python -c \""
                  + "; ".join(f"import {m}" for m in
                              (spec.smoke or [spec.package.replace('-', '_')]))
                  + "\"")
+    steps.append("micromamba clean -y --all")
     return steps
 
 
