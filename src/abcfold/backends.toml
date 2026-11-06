@@ -61,6 +61,40 @@ python = "3.12"
 env = "abcfold2-rosettafold3"
 pip = ["rc-foundry[rf3]==0.1.12"]
 
+[intellifold]
+package = "intellifold"
+version = "2.0.4"
+python = "3.12"
+env = "abcfold2-intellifold"
+pip = ["intellifold==2.0.4"]
+torch_backend = "cu128"
+# The intellifold wheel wraps a vendored AlphaFold 3 JAX engine that is not on
+# PyPI; build it into the env with
+# `pip install ./third_party/alphafold3 && build_data` from the IntelliFold
+# checkout. ABCFold reports the missing engine instead of failing mid-run.
+engine_package = "alphafold3"
+
+[opendde]
+package = "opendde"
+version = "1.2.0"
+python = "3.11"
+env = "abcfold2-opendde"
+pip = ["opendde[gpu]==1.2.0"]
+torch_backend = "cu128"
+model = "opendde_v1"
+
+[esmfold2]
+package = "esm"
+version = "3.4.2"
+python = "3.12"
+env = "abcfold2-esmfold2"
+pip = ["esm==3.4.2"]
+torch_backend = "cu128"
+# ESMFold2 has no CLI: ABCFold runs its Python API through a runner script
+# inside this environment. Weights come from the Hugging Face repo below.
+model = "biohub/ESMFold2"
+device = "cuda"
+
 [alphafold3]
 # AlphaFold 3 runs through an external container/command (see `abcfold run
 # --af3_runner`); the version is informational and reported in report.json.

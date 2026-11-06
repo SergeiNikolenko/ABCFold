@@ -87,7 +87,8 @@ def msa_argparse_util(parser):
     )
     parser.add_argument(
         "--msa_server_url",
-        help="[optional] ColabFold MMseqs2 API URL (default: https://api.colabfold.com)",
+        help=dedent("[optional] ColabFold MMseqs2 API URL \
+        (default: https://api.colabfold.com)"),
     )
     parser.add_argument(
         "--min_msa_rows",
@@ -357,6 +358,42 @@ def rosettafold_argparse_util(parser):
     return parser
 
 
+def intellifold_argparse_util(parser):
+    parser.add_argument(
+        "-i",
+        "--intellifold",
+        action="store_true",
+        help="Run IntelliFold",
+    )
+    parser.add_argument(
+        "--intellifold_weights",
+        help=dedent("[optional] Directory holding the IntelliFold weights. \
+        If not specified, parameters are downloaded to ~/.intellifold/model_v2/"),
+        default=None,
+    )
+    return parser
+
+
+def opendde_argparse_util(parser):
+    parser.add_argument(
+        "-d",
+        "--opendde",
+        action="store_true",
+        help="Run OpenDDE",
+    )
+    return parser
+
+
+def esmfold2_argparse_util(parser):
+    parser.add_argument(
+        "-e",
+        "--esmfold2",
+        action="store_true",
+        help="Run ESMFold2",
+    )
+    return parser
+
+
 def alphafold_argparse_util(parser):
     parser.add_argument(
         "--database",
@@ -459,10 +496,14 @@ def raise_argument_errors(args):
         and not args.protenix
         and not args.openfold3
         and not args.rosettafold3
+        and not getattr(args, "intellifold", False)
+        and not getattr(args, "opendde", False)
+        and not getattr(args, "esmfold2", False)
     ):
         logger.info(
-            dedent("None of AlphaFold3, Boltz, Chai-1, Protenix, OpenFold3 or \
-            RosettaFold3 selected. Running AlphaFold3 by default")
+            dedent("None of AlphaFold3, Boltz, Chai-1, Protenix, OpenFold3, \
+            RosettaFold3, IntelliFold, OpenDDE or ESMFold2 selected. \
+            Running AlphaFold3 by default")
         )
         args.alphafold3 = True
 
@@ -520,7 +561,9 @@ def raise_argument_errors(args):
         logger.error("--msa custom requires --msa_a3m")
         sys.exit(1)
 
-    if getattr(args, "msa", "auto") == "af3" and not getattr(args, "af3_data_json", None):
+    if getattr(args, "msa", "auto") == "af3" and not getattr(
+        args, "af3_data_json", None
+    ):
         logger.error("--msa af3 requires --af3_data_json")
         sys.exit(1)
 

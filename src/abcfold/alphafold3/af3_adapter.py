@@ -9,7 +9,6 @@ be run separately: ``data_pipeline`` writes ``<name>/<name>_data.json``, which
 
 from __future__ import annotations
 
-from abcfold.gpus import docker_gpu_flags, to_physical
 import copy
 import csv
 import json
@@ -22,6 +21,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Mapping, Optional, Sequence
+
+from abcfold.gpus import docker_gpu_flags, to_physical
 
 logger = logging.getLogger("logger")
 
@@ -155,7 +156,9 @@ def build_af3_command(
         return argv
 
     if needs_models and not cfg.model_dir:
-        raise ValueError("AlphaFold 3 inference needs a model directory (--model_params)")
+        raise ValueError(
+            "AlphaFold 3 inference needs a model directory (--model_params)"
+        )
     if needs_dbs and not cfg.db_dir:
         raise ValueError(
             "The AlphaFold 3 data pipeline needs a database directory (--database)"
@@ -166,10 +169,10 @@ def build_af3_command(
         (str(output_dir), CONTAINER_OUTPUT_DIR, False),
     ]
     if needs_models:
-        mounts.append((str(Path(cfg.model_dir).expanduser().resolve()),
+        mounts.append((str(Path(str(cfg.model_dir)).expanduser().resolve()),
                        CONTAINER_MODEL_DIR, True))
     if needs_dbs:
-        mounts.append((str(Path(cfg.db_dir).expanduser().resolve()),
+        mounts.append((str(Path(str(cfg.db_dir)).expanduser().resolve()),
                        CONTAINER_DB_DIR, True))
 
     flags = af3_flags(
@@ -229,7 +232,9 @@ def prepare_inference_input(params: dict) -> dict:
     for entry in params.get("sequences", []):
         if "protein" in entry:
             protein = entry["protein"]
-            if protein.get("unpairedMsa") is None and not protein.get("unpairedMsaPath"):
+            if protein.get("unpairedMsa") is None and not protein.get(
+                "unpairedMsaPath"
+            ):
                 logger.warning(
                     "AF3 inference-only: chain %s has no MSA, using single sequence",
                     protein.get("id"),
@@ -272,7 +277,8 @@ class Af3Result:
 
 
 def find_af3_job_dir(output_dir: Path | str, name: str) -> Optional[Path]:
-    """Locate ``<output_dir>/<name>`` or AF3's timestamped ``<name>_YYYYMMDD_HHMMSS``."""
+    """Locate ``<output_dir>/<name>`` or AF3's timestamped
+    ``<name>_YYYYMMDD_HHMMSS``."""
     output_dir = Path(output_dir)
     base = sanitised_name(name)
     candidates = [p for p in output_dir.glob(f"{base}*") if p.is_dir() and (

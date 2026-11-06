@@ -124,7 +124,9 @@ class ColabFoldClient:
             raise ColabFoldError(
                 f"ColabFold MSA server returned status {status}: {ticket}"
             )
-        return ticket_id
+        if ticket_id is None:
+            raise ColabFoldError(f"ColabFold MSA ticket carries no id: {ticket}")
+        return str(ticket_id)
 
     def _download(self, ticket_id: str) -> Dict[str, str]:
         response = self.session.get(

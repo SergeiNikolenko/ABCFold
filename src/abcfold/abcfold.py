@@ -15,8 +15,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from abcfold.argparse_utils import (alphafold_argparse_util,
                                     boltz_argparse_util, chai_argparse_util,
                                     custom_template_argpase_util,
+                                    esmfold2_argparse_util,
+                                    intellifold_argparse_util,
                                     main_argpase_util, mmseqs2_argparse_util,
-                                    msa_argparse_util, openfold_argparse_util,
+                                    msa_argparse_util, opendde_argparse_util,
+                                    openfold_argparse_util,
                                     prediction_argparse_util,
                                     protenix_argparse_util,
                                     raise_argument_errors,
@@ -25,6 +28,9 @@ from abcfold.argparse_utils import (alphafold_argparse_util,
 from abcfold.output.alphafold3 import AlphafoldOutput
 from abcfold.output.boltz import BoltzOutput
 from abcfold.output.chai import ChaiOutput
+from abcfold.output.esmfold2 import Esmfold2Output
+from abcfold.output.intellifold import IntellifoldOutput
+from abcfold.output.opendde import OpenDDEOutput
 from abcfold.output.openfold3 import OpenfoldOutput
 from abcfold.output.protenix import ProtenixOutput
 from abcfold.output.rosettafold3 import RosettafoldOutput
@@ -41,7 +47,7 @@ HTML_TEMPLATE = HTML_DIR.joinpath("abcfold.html.jinja2")
 PLOTS_DIR = ".plots"
 
 ENGINE_ORDER = ("alphafold3", "boltz", "chai1", "protenix", "openfold3",
-                "rosettafold3")
+                "rosettafold3", "intellifold", "opendde", "esmfold2")
 DISPLAY_NAMES = {
     "alphafold3": "AlphaFold3",
     "boltz": "Boltz",
@@ -49,6 +55,9 @@ DISPLAY_NAMES = {
     "protenix": "Protenix",
     "openfold3": "OpenFold3",
     "rosettafold3": "RosettaFold3",
+    "intellifold": "IntelliFold",
+    "opendde": "OpenDDE",
+    "esmfold2": "ESMFold2",
 }
 MODEL_PREFIX = {
     "alphafold3": "af3",
@@ -57,6 +66,9 @@ MODEL_PREFIX = {
     "protenix": "protenix",
     "openfold3": "openfold",
     "rosettafold3": "rosettafold",
+    "intellifold": "intellifold",
+    "opendde": "opendde",
+    "esmfold2": "esmfold2",
 }
 EXIT_OK, EXIT_FAILED, EXIT_PARTIAL = 0, 1, 2
 
@@ -67,6 +79,9 @@ ModelOutput = Union[
     ProtenixOutput,
     OpenfoldOutput,
     RosettafoldOutput,
+    IntellifoldOutput,
+    OpenDDEOutput,
+    Esmfold2Output,
 ]
 
 
@@ -90,6 +105,7 @@ CLI_SETTINGS = {
     "af3_image": "af3_image",
     "af3_command": "af3_command",
     "template_mirror_dir": "template_mirror_dir",
+    "intellifold_weights": "intellifold_weights",
     "boltz_preprocessing_threads": "boltz_preprocessing_threads",
     "boltz_num_workers": "boltz_num_workers",
     "boltz_max_parallel_samples": "boltz_max_parallel_samples",
@@ -261,6 +277,12 @@ def run(args, settings: Optional[Settings] = None) -> int:
                                                input_params, temp_dir, name),
             "rosettafold3": lambda: _run_rosettafold(args, rt_config, run_json,
                                                      input_params, name),
+            "intellifold": lambda: _run_intellifold(args, rt_config, run_json,
+                                                    input_params, name),
+            "opendde": lambda: _run_opendde(args, rt_config, run_json,
+                                            input_params, name),
+            "esmfold2": lambda: _run_esmfold2(args, rt_config, run_json,
+                                              input_params, name),
         }
 
         for engine in engines:
@@ -573,6 +595,60 @@ def _run_rosettafold(args, rt_config, run_json, input_params, name):
     )
 
 
+def _run_intellifold(args, rt_config, run_json, input_params, name):
+    from abcfold.intellifold.run_intellifold import run_intellifold
+
+    ok = run_intellifold(
+        input_json=run_json,
+        output_dir=args.output_dir,
+        save_input=args.save_input,
+        number_of_models=args.number_of_models,
+        config=rt_config,
+    )
+    if not ok:
+        return EngineOutcome(False)
+    dirs = list(args.output_dir.glob("intellifold_results*"))
+    return EngineOutcome(
+        True, IntellifoldOutput(dirs, input_params, name, args.save_input)
+    )
+
+
+def _run_opendde(args, rt_config, run_json, input_params, name):
+    from abcfold.opendde.run_opendde import run_opendde
+
+    ok = run_opendde(
+        input_json=run_json,
+        output_dir=args.output_dir,
+        save_input=args.save_input,
+        number_of_models=args.number_of_models,
+        config=rt_config,
+    )
+    if not ok:
+        return EngineOutcome(False)
+    dirs = list(args.output_dir.glob("opendde_results*"))
+    return EngineOutcome(
+        True, OpenDDEOutput(dirs, input_params, name, args.save_input)
+    )
+
+
+def _run_esmfold2(args, rt_config, run_json, input_params, name):
+    from abcfold.esmfold2.run_esmfold2 import run_esmfold2
+
+    ok = run_esmfold2(
+        input_json=run_json,
+        output_dir=args.output_dir,
+        save_input=args.save_input,
+        number_of_models=args.number_of_models,
+        config=rt_config,
+    )
+    if not ok:
+        return EngineOutcome(False)
+    dirs = list(args.output_dir.glob("esmfold2_results*"))
+    return EngineOutcome(
+        True, Esmfold2Output(dirs, input_params, name, args.save_input)
+    )
+
+
 def render_html(outputs: List[Tuple[str, ModelOutput]], output_dir: Path,
                 no_server: bool = False) -> None:
     """Build the interactive HTML page (and optionally serve it)."""
@@ -622,7 +698,7 @@ def render_html(outputs: List[Tuple[str, ModelOutput]], output_dir: Path,
     prefix_by_display = {DISPLAY_NAMES[e]: MODEL_PREFIX[e] for e in DISPLAY_NAMES}
     models_dir = output_dir.joinpath("output_models")
     models_dir.mkdir(parents=True, exist_ok=True)
-    output_models = []
+    output_models: List[Union[str, Path]] = []
     for model in combined_models:
         cif_file = output_dir.joinpath(model["model_path"])
         out_name = (f"{prefix_by_display[model['model_source']]}_model_"
@@ -718,6 +794,9 @@ def build_run_parser(parser=None):
         openfold_argparse_util,
         protenix_argparse_util,
         rosettafold_argparse_util,
+        intellifold_argparse_util,
+        opendde_argparse_util,
+        esmfold2_argparse_util,
         mmseqs2_argparse_util,
         custom_template_argpase_util,
         prediction_argparse_util,

@@ -12,6 +12,7 @@ af3_sif_path = ""
 boltz_weights = ""
 openfold_weights = ""
 rosettafold_weights = ""
+intellifold_weights = ""
 protenix_root_dir = ""
 # Shared across Chai envs so a new env does not re-download ~6.5 GB of weights
 chai_downloads_dir = "~/.cache/abcfold/chai"

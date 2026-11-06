@@ -47,7 +47,9 @@ def protenix_runtime_env(
     if root:
         extra["PROTENIX_ROOT_DIR"] = str(Path(str(root)).expanduser())
     if gpus not in (None, "all"):
-        extra["CUDA_VISIBLE_DEVICES"] = to_physical(gpus, environ)
+        physical = to_physical(gpus, environ)
+        if physical is not None:
+            extra["CUDA_VISIBLE_DEVICES"] = physical
     return extra
 
 
