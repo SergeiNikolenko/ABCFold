@@ -1,18 +1,30 @@
 {
     "name": "2PV7",
-    "modelSeeds": [1],
+    "modelSeeds": [
+        1
+    ],
     "sequences": [
-      {
-        "protein": {
-          "id": "A",
-          "sequence": "GMRESYANENQFGFKTINSDIHKIVIVGGYGKLGGLFARYLRASGYPISILDREDWAVAESILANADVVIVSVPINLTLETIERLKPYLTENMLLADLTSVKREPLAKMLEVHTGAVLGLHPMFGADIASMAKQVVVRCDGRFPERYEWLLEQIQIWGAKIYQTNATEHDHNMTYIQALRHFSTFANGLHLSKQPINLANLLALSSPIYRLELAMIGRLFAQDAELYADIIMDKSENLAVIETLKQTYDEALTFFENNDRQGFIDAFHKVRDWFGDYSEQFLKESRQLLQQANDLKQG"
-
+        {
+            "protein": {
+                "id": "A",
+                "sequence": "GMRESYANENQFGFKTINSDIHKIVIVGGYGKLGGLFARYLRASGYPISILDREDWAVAESILANADVVIVSVPINLTLETIERLKPYLTENMLLADLTSVKREPLAKMLEVHTGAVLGLHPMFGADIASMAKQVVVRCDGRFPERYEWLLEQIQIWGAKIYQTNATEHDHNMTYIQALRHFSTFANGLHLSKQPINLANLLALSSPIYRLELAMIGRLFAQDAELYADIIMDKSENLAVIETLKQTYDEALTFFENNDRQGFIDAFHKVRDWFGDYSEQFLKESRQLLQQANDLKQG"
+            }
         }
-      }
     ],
     "bondedAtomPairs": [
-    [["A", 1, "CA"], ["A", 20, "CA"]]
-  ],
+        [
+            [
+                "A",
+                1,
+                "CA"
+            ],
+            [
+                "A",
+                20,
+                "CA"
+            ]
+        ]
+    ],
     "dialect": "alphafold3",
     "version": 1
-  }
+}

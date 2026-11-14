@@ -1,0 +1,36 @@
+/alphafold3_venv/lib/python3.12/site-packages/keras/src/export/tf2onnx_lib.py:8: FutureWarning: In the future `np.object` will be defined as the corresponding NumPy scalar.
+  if not hasattr(np, "object"):
+INFO:2026-03-23 09:28:59,467:jax._src.xla_bridge:812: Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+I0323 09:28:59.467072 138278458032896 xla_bridge.py:812] Unable to initialize backend 'tpu': INTERNAL: Failed to open libtpu.so: libtpu.so: cannot open shared object file: No such file or directory
+W0323 09:29:01.633183     328 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0323 09:29:01.640909     331 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0323 09:29:01.646754     335 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0323 09:29:01.648373     332 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0323 09:29:01.685390     329 platform_util.cc:218] unable to create StreamExecutor for CUDA:3: : CUDA_ERROR_OUT_OF_MEMORY: out of memory
+W0323 09:29:01.691030     334 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0323 09:29:01.719965     330 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0323 09:29:01.748218     333 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0323 09:29:01.834448       1 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0323 09:29:01.839955       1 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0323 09:29:01.844512       1 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0323 09:29:01.849537       1 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0323 09:29:01.854308       1 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0323 09:29:01.859223       1 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+W0323 09:29:01.863067       1 cuda_executor.cc:1802] GPU interconnect information not available: INTERNAL: NVML doesn't support extracting fabric info or NVLink is not used by the device.
+Traceback (most recent call last):
+  File "/app/alphafold/run_alphafold.py", line 741, in <module>
+    app.run(main)
+  File "/alphafold3_venv/lib/python3.12/site-packages/absl/app.py", line 316, in run
+    _run_main(main, args)
+  File "/alphafold3_venv/lib/python3.12/site-packages/absl/app.py", line 261, in _run_main
+    sys.exit(main(argv))
+             ^^^^^^^^^^
+  File "/app/alphafold/run_alphafold.py", line 519, in main
+    pdb_database_path=expand_path(_PDB_DATABASE_PATH.value),
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/alphafold/run_alphafold.py", line 516, in <lambda>
+    expand_path = lambda x: replace_db_dir(x, DB_DIR.value)
+                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/app/alphafold/run_alphafold.py", line 420, in replace_db_dir
+    raise FileNotFoundError(
+FileNotFoundError: ${DB_DIR}/mmcif_files with ${DB_DIR} not found in any of ['/root/public_databases'].
