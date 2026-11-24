@@ -25,7 +25,7 @@ def cfg(tmp_path):
 
 
 def test_sanitised_name():
-    # Same rule as AlphaFold 3: lower case, spaces to "_", drop everything outside [a-z0-9_-.]
+    # Same rule as AF3: lowercase, spaces -> _, drop chars outside [a-z0-9_-.]
     assert sanitised_name("KRAS G12D (MRTX1133)") == "kras_g12d_mrtx1133"
 
 

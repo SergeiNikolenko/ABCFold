@@ -1,4 +1,3 @@
-import configparser
 import json
 from itertools import zip_longest
 from pathlib import Path
@@ -371,6 +370,47 @@ class Af3Pae:
 
         return cls(af3_scores)
 
+    @classmethod
+    def from_matrix(cls, pae_matrix: np.ndarray, cif_file: CifFile):
+        """
+        Build AF3-style scores from a bare PAE matrix plus a structure.
+
+        This is the generic counterpart to the tool-specific ``from_*``
+        constructors above: it is used whenever a PAE source does not carry
+        its own per-token chain/residue ids, such as PAE files auto-detected
+        by ``Ipsae.parse_pae_file``.
+        """
+        pae_matrix = np.asarray(pae_matrix)
+        af3_scores = AF3TEMPLATE.copy()
+
+        chain_lengths = cif_file.chain_lengths(mode="residues", ligand_atoms=True)
+        residue_lengths = cif_file.chain_lengths(mode="all", ligand_atoms=True)
+
+        atom_chain_ids = flatten(
+            [[key] * value for key, value in residue_lengths.items()]
+        )
+
+        atom_plddts = cif_file.plddts
+        token_chain_ids = flatten(
+            [[key] * value for key, value in chain_lengths.items()]
+        )
+
+        token_res_ids = flatten(
+            [
+                [value for value in values]
+                for _, values in cif_file.token_residue_ids().items()
+            ]
+        )
+
+        af3_scores["pae"] = pae_matrix.tolist()
+        af3_scores["atom_chain_ids"] = atom_chain_ids
+        af3_scores["atom_plddts"] = atom_plddts
+        af3_scores["contact_probs"] = np.zeros(shape=pae_matrix.shape).tolist()
+        af3_scores["token_chain_ids"] = token_chain_ids
+        af3_scores["token_res_ids"] = token_res_ids
+
+        return cls(af3_scores)
+
     def __init__(self, af3_scores: dict):
         self.scores = af3_scores
 
@@ -399,7 +439,8 @@ def get_gap_indicies(*cif_objs) -> List[np.ndarray]:
     """
     indicies: list = []
 
-    if len(cif_objs) == 1:
+    # Nothing to align with fewer than two models (0 or 1).
+    if len(cif_objs) <= 1:
         return indicies
     chain_lengths = [
         cif.chain_lengths(mode="residues", ligand_atoms=True) for cif in cif_objs

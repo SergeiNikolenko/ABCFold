@@ -2,6 +2,7 @@ import json
 import logging
 import random
 import string
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -19,7 +20,12 @@ class BoltzYaml:
     Object to convert an AlphaFold3 json file to a boltzmann yaml file.
     """
 
-    def __init__(self, working_dir: Union[str, Path], create_files: bool = True):
+    def __init__(
+        self,
+        working_dir: Union[str, Path],
+        create_files: bool = True,
+        template_threshold: Optional[float] = None,
+    ):
         self.working_dir = working_dir
         self.yaml_string: str = ""
         self.msa_file: Optional[Union[str, Path]] = "null"
@@ -30,6 +36,8 @@ class BoltzYaml:
         self.__create_files = create_files
         self.__non_ligands: List[str] = []
         self.__id_buffer: dict = {}
+        self.__template_entries: List[dict] = []
+        self.__template_threshold = template_threshold
 
     @property
     def chain_ids(self) -> List[Union[str, int]]:
@@ -78,6 +86,70 @@ class BoltzYaml:
         with open(file_path, "w") as f:
             f.write(msa)
 
+    def _write_template_cifs(self, templates: list) -> List[str]:
+        """Write inline mmCIF templates to .cif files for Boltz."""
+        cif_paths: List[str] = []
+        tmpl_dir = Path(self.working_dir) / f"templates_{uuid.uuid4().hex}"
+        if self.__create_files:
+            tmpl_dir.mkdir(parents=True, exist_ok=True)
+        for idx, template in enumerate(templates):
+            mmcif = template.get("mmcif") if isinstance(template, dict) else None
+            if not mmcif:
+                continue
+            cif_file = tmpl_dir / f"template_{idx}.cif"
+            if self.__create_files:
+                self._normalise_template_cif(mmcif, cif_file)
+            cif_paths.append(cif_file.resolve().as_posix())
+        return cif_paths
+
+    def _normalise_template_cif(self, mmcif: str, out_file: Path) -> None:
+        """Rewrite an inline mmCIF so Boltz gemmi parser can read it."""
+        try:
+            import gemmi
+
+            doc = gemmi.cif.read_string(mmcif)
+            st = gemmi.make_structure_from_block(doc[0])
+            if len(st) == 0:
+                raise ValueError("template mmCIF has no models")
+            st.setup_entities()
+
+            model0 = st[0]
+            for entity in st.entities:
+                if entity.entity_type.name != "Polymer" or entity.full_sequence:
+                    continue
+                if not entity.subchains:
+                    continue
+                first_subchain = entity.subchains[0]
+                seq = [
+                    residue.name
+                    for chain in model0
+                    for residue in chain
+                    if residue.subchain == first_subchain
+                ]
+                if seq:
+                    entity.full_sequence = seq
+
+            st.make_mmcif_document().write_file(str(out_file))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not normalise template CIF (%s); writing it unchanged", exc
+            )
+            Path(out_file).write_text(mmcif)
+
+    def add_templates(self) -> str:
+        """Build template YAML items for inline protein templates."""
+        if not self.__template_entries:
+            return ""
+        yaml_string = ""
+        for entry in self.__template_entries:
+            yaml_string += f"{DELIM}- cif: {entry['cif']}\n"
+            if self.__template_threshold is not None:
+                yaml_string += f"{DELIM}  force: true\n"
+                yaml_string += (
+                    f"{DELIM}  threshold: {self.__template_threshold}\n"
+                )
+        return yaml_string
+
     def json_to_yaml(
         self,
         json_file_or_dict: Union[dict, str, Path],
@@ -100,6 +172,7 @@ class BoltzYaml:
         self.get_ids(json_dict["sequences"])
 
         self.yaml_string = ""
+        self.__template_entries = []
         constraints_string = ""
 
         self.yaml_string += self.add_version_number("1")
@@ -127,10 +200,14 @@ class BoltzYaml:
         if constraints_string:
             self.yaml_string += self.add_non_indented_string("constraints")
             self.yaml_string += constraints_string
+        templates_body = ""
         templates = json_dict.get("templates")
         if isinstance(templates, list) and templates:
+            templates_body += self.templates_to_yaml(templates)
+        templates_body += self.add_templates()
+        if templates_body:
             self.yaml_string += self.add_non_indented_string("templates")
-            self.yaml_string += self.templates_to_yaml(templates)
+            self.yaml_string += templates_body
 
         return self.yaml_string
 
@@ -471,6 +548,13 @@ class BoltzYaml:
 
         if "modifications" in sequence_dict and sequence_dict["modifications"]:
             yaml_string += self.add_modifications(sequence_dict["modifications"])
+
+        templates = sequence_dict.get("templates")
+        if templates:
+            for cif_path in self._write_template_cifs(templates):
+                self.__template_entries.append(
+                    {"cif": cif_path, "chain_id": sequence_dict["id"]}
+                )
 
         return yaml_string
 

@@ -138,6 +138,22 @@ class MicromambaEnv:
         except (subprocess.CalledProcessError, FileNotFoundError):
             return None
 
+    def which(self, command: str) -> bool:
+        """Return True if command is on PATH inside the environment."""
+        if self.is_current:
+            return shutil.which(command) is not None
+        code = "import shutil, sys; sys.exit(0 if shutil.which(sys.argv[1]) else 1)"
+        try:
+            subprocess.check_call(
+                self.prefix_command(["python", "-c", code, command]),
+                env=_clean_env(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+
     def env_exists(self) -> bool:
         if self.is_current:
             return True
@@ -275,6 +291,20 @@ class ContainerEnv:
             self.runner, "exec", "--nv", "--cleanenv", *mounts,
             "--pwd", os.getcwd(), self.image, *command,
         ]
+
+    def which(self, command: str) -> bool:
+        """Return True if command is on PATH inside the container."""
+        code = "import shutil, sys; sys.exit(0 if shutil.which(sys.argv[1]) else 1)"
+        try:
+            subprocess.check_call(
+                self.prefix_command(["python", "-c", code, command]),
+                env=_clean_env(),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
 
     def env_exists(self) -> bool:
         if self.runner == "docker":

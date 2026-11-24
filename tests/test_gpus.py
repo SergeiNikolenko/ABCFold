@@ -24,8 +24,12 @@ def test_index_outside_mask_fails():
 
 
 def test_docker_never_sees_all_host_gpus_under_a_mask():
-    assert docker_gpu_flags("all", {"CUDA_VISIBLE_DEVICES": "2"}) == ["--gpus", "device=2"]
-    assert docker_gpu_flags("0", {"CUDA_VISIBLE_DEVICES": "3"}) == ["--gpus", "device=3"]
+    assert docker_gpu_flags("all", {"CUDA_VISIBLE_DEVICES": "2"}) == [
+        "--gpus", "device=2",
+    ]
+    assert docker_gpu_flags("0", {"CUDA_VISIBLE_DEVICES": "3"}) == [
+        "--gpus", "device=3",
+    ]
     assert docker_gpu_flags("all", {}) == ["--gpus", "all"]
     assert docker_gpu_flags("cpu", {}) == []
 
@@ -33,5 +37,7 @@ def test_docker_never_sees_all_host_gpus_under_a_mask():
 def test_backend_envs_use_physical_ids(monkeypatch):
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2")
     assert _gpu_env("0") == {"CUDA_VISIBLE_DEVICES": "2"}
-    extra = protenix_runtime_env({}, "0", nvcc_available=True, environ={"CUDA_VISIBLE_DEVICES": "2"})
+    extra = protenix_runtime_env(
+        {}, "0", nvcc_available=True, environ={"CUDA_VISIBLE_DEVICES": "2"}
+    )
     assert extra["CUDA_VISIBLE_DEVICES"] == "2"

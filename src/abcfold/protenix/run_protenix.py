@@ -212,6 +212,6 @@ def generate_protenix_command(
 def generate_protenix_test_command() -> list:
     return [
         "protenix",
-        "predict",
+        "pred",
         "--help",
     ]

@@ -1,7 +1,6 @@
 import json
 import logging
-import random
-import string
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
@@ -23,6 +22,7 @@ class OpenfoldJson:
         self.name = ""
         self.openfold_dict: Dict = {"queries": {}}
         self.templates = templates
+        self._use_templates = False
 
     @property
     def chain_ids(self) -> Dict:
@@ -42,6 +42,20 @@ class OpenfoldJson:
 
         with open(file_path, "w") as f:
             f.write(msa)
+
+    def _write_template_cifs(self, templates: list) -> list:
+        """Write inline mmCIF templates to .cif files for CIF-direct mode."""
+        cif_paths: list = []
+        tmpl_dir = Path(self.working_dir) / f"templates_{uuid.uuid4().hex}"
+        tmpl_dir.mkdir(parents=True, exist_ok=True)
+        for idx, template in enumerate(templates):
+            mmcif = template.get("mmcif") if isinstance(template, dict) else None
+            if not mmcif:
+                continue
+            cif_file = tmpl_dir / f"template_{idx}.cif"
+            cif_file.write_text(mmcif)
+            cif_paths.append(cif_file.resolve().as_posix())
+        return cif_paths
 
     def json_to_json(
         self,
@@ -121,15 +135,20 @@ class OpenfoldJson:
                 ptm_type = mod['ptmType']
                 protein_chain["non_canonical_residues"][loc] = ptm_type
 
-        if self.templates:
+        templates = seq_dict.get("templates")
+        if templates and self.__create_files:
+            cif_paths = self._write_template_cifs(templates)
+            if cif_paths:
+                protein_chain["template_cif_paths"] = cif_paths
+                self._use_templates = True
+        elif self.templates:
             protein_chain[
                 "template_alignment_file_path"
             ] = self.templates.resolve().as_posix()
 
         unpaired_msa = seq_dict.get("unpairedMsa")
         paired_msa = seq_dict.get("pairedMsa")
-        random_string = ''.join(random.choices(string.ascii_letters, k=5))
-        msa_dir = Path(self.working_dir) / random_string
+        msa_dir = Path(self.working_dir) / uuid.uuid4().hex
         if unpaired_msa:
             msa_out = msa_dir / "colabfold_main.a3m"
             if self.__create_files:
@@ -237,14 +256,16 @@ class OpenfoldJson:
         Without either, templates are disabled.
         """
         seeds_str = f"[{', '.join(str(s) for s in self.seeds)}]"
-        use_templates = self.templates is not None
-        if use_templates and not fetch_templates and not template_mirror_dir:
-            logger.warning(
-                "OpenFold3 templates need a local mmCIF mirror "
-                "(--template_mirror_dir) or --openfold_fetch_templates; "
-                "running OpenFold3 without templates"
-            )
-            use_templates = False
+        use_templates = self._use_templates
+        if not use_templates and self.templates is not None:
+            if not fetch_templates and not template_mirror_dir:
+                logger.warning(
+                    "OpenFold3 templates need a local mmCIF mirror "
+                    "(--template_mirror_dir) or --openfold_fetch_templates; "
+                    "running OpenFold3 without templates"
+                )
+            else:
+                use_templates = True
 
         lines = [
             "model_update:",

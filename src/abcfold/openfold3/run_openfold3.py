@@ -63,9 +63,14 @@ def run_openfold(
         if save_input:
             logger.info("Saving input json file and msa to the output directory")
             working_dir = output_dir
+            working_dir.mkdir(parents=True, exist_ok=True)
 
         openfold_json = OpenfoldJson(working_dir, templates=template_hits_path)
         openfold_json.json_to_json(input_json)
+
+        out_file = working_dir.joinpath(f"{input_json.stem}.json")
+        openfold_json.write_json(out_file)
+
         runner_yaml = working_dir / "openfold3_runner.yml"
         openfold_json.write_yaml(
             runner_yaml,
@@ -76,37 +81,32 @@ def run_openfold(
             cache_dir=cache_dir,
         )
 
-        for seed in openfold_json.seeds:
-            out_file = working_dir.joinpath(f"{input_json.stem}_seed-{seed}.json")
-
-            openfold_json.write_json(out_file)
-            logger.info("Running OpenFold 3 using seed: %s", seed)
-            openfold_out_dir = output_dir / f"openfold_results_seed-{seed}"
-            cmd = (
-                generate_openfold_command(
-                    out_file,
-                    openfold_out_dir,
-                    runner_yaml,
-                    ckpt_path,
-                    number_of_models,
-                    checkpoint_name=None if ckpt_path else ckpt_name,
-                )
-                if not test
-                else generate_openfold_test_command()
+        logger.info("Running OpenFold 3 using seeds: %s", openfold_json.seeds)
+        openfold_out_dir = output_dir / "openfold_results"
+        cmd = (
+            generate_openfold_command(
+                out_file,
+                openfold_out_dir,
+                runner_yaml,
+                ckpt_path,
+                number_of_models,
+                checkpoint_name=None if ckpt_path else ckpt_name,
             )
-            if test:
-                continue
-
+            if not test
+            else generate_openfold_test_command()
+        )
+        if not test:
+            extra_env = _gpu_env(gpus) | {"OPENFOLD_CACHE": str(cache_dir)}
             try:
                 assert env is not None
-                env.run(cmd, extra_env=_gpu_env(gpus) | {"OPENFOLD_CACHE": str(cache_dir)})
+                env.run(cmd, extra_env=extra_env)
             except subprocess.CalledProcessError as e:
                 _write_error(output_dir, "openfold_error.log", e)
                 return False
 
             if not list(openfold_out_dir.rglob("*_model.cif")):
                 logger.error(
-                    "OpenFold 3 exited without writing a structure for seed %s", seed
+                    "OpenFold 3 exited without writing any structures"
                 )
                 return False
 

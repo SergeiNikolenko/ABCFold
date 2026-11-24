@@ -86,7 +86,7 @@ def _load_boltz_input(
     boltz_template_chain_id: list[str] | None,
     boltz_template_id: list[str] | None,
     boltz_template_force: bool,
-    boltz_template_threshold: float,
+    boltz_template_threshold: float | None,
     boltz_pocket_radius: float,
     boltz_pocket_max_distance: float,
     boltz_pocket_force: bool,
@@ -105,7 +105,9 @@ def _load_boltz_input(
         template_chain_id=boltz_template_chain_id,
         template_id=boltz_template_id,
         template_force=boltz_template_force,
-        template_threshold=boltz_template_threshold,
+        template_threshold=(
+            2.0 if boltz_template_threshold is None else boltz_template_threshold
+        ),
         pocket_radius=boltz_pocket_radius,
         pocket_max_distance=boltz_pocket_max_distance,
         pocket_force=boltz_pocket_force,
@@ -159,7 +161,7 @@ def run_boltz(
     boltz_template_chain_id: list[str] | None = None,
     boltz_template_id: list[str] | None = None,
     boltz_template_force: bool = False,
-    boltz_template_threshold: float = 2.0,
+    boltz_template_threshold: float | None = None,
     boltz_pocket_radius: float = 6.0,
     boltz_pocket_max_distance: float = 6.0,
     boltz_pocket_force: bool = False,
@@ -212,7 +214,12 @@ def run_boltz(
             logger.info("Saving input yaml file and msa to the output directory")
             working_dir = output_dir
 
-        boltz_yaml = BoltzYaml(working_dir)
+        inline_threshold = (
+            boltz_template_threshold
+            if boltz_template_threshold is not None
+            else (2.0 if boltz_template_force else None)
+        )
+        boltz_yaml = BoltzYaml(working_dir, template_threshold=inline_threshold)
         input_params = _load_boltz_input(
             input_json,
             boltz_mode,
@@ -291,7 +298,7 @@ def run_boltz_batch(
     boltz_template_chain_id: list[str] | None = None,
     boltz_template_id: list[str] | None = None,
     boltz_template_force: bool = False,
-    boltz_template_threshold: float = 2.0,
+    boltz_template_threshold: float | None = None,
     boltz_pocket_radius: float = 6.0,
     boltz_pocket_max_distance: float = 6.0,
     boltz_pocket_force: bool = False,
@@ -348,10 +355,15 @@ def run_boltz_batch(
         if save_input:
             _link_or_copy_input(input_json, output_dir)
 
+        inline_threshold = (
+            boltz_template_threshold
+            if boltz_template_threshold is not None
+            else (2.0 if boltz_template_force else None)
+        )
         for seed in seeds:
             seed_dir = batch_root / f"seed-{seed}"
             seed_dir.mkdir(parents=True, exist_ok=True)
-            boltz_yaml = BoltzYaml(seed_dir)
+            boltz_yaml = BoltzYaml(seed_dir, template_threshold=inline_threshold)
             boltz_yaml.json_to_yaml(input_params)
             boltz_yaml.write_yaml(seed_dir / f"{input_json.stem}_seed-{seed}.yaml")
             seed_dirs[int(seed)] = seed_dir

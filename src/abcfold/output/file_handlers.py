@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
-from Bio.PDB import MMCIFIO, Chain, MMCIFParser, Model
+from Bio.PDB import MMCIFIO, MMCIFParser, Model
+from Bio.PDB.Chain import Chain
 from Bio.PDB.Atom import Atom
 from Bio.PDB.kdtrees import KDTree
 from Bio.PDB.Polypeptide import is_aa

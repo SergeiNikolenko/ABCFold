@@ -117,3 +117,58 @@ def test_af3_pae_reorder(test_data, tmp_path):
             pae_obj.scores["token_chain_ids"][787 + 50 :]  # noqa: E203
             == pae_to_compare_tci[:51]
         )
+
+
+def test_limit_msa_depth_and_json():
+    from abcfold.scripts.abc_script_utils import (limit_json_msa_depth,
+                                                  limit_msa_depth)
+
+    a3m = ">query\nMKVLA\n>h1\nMKVLA\n>h2\nMKVLG\n>h3\nMRVLA\n"
+    out = limit_msa_depth(a3m, 2)
+    assert out.count(">") == 2
+    assert out.startswith(">query")
+    assert limit_msa_depth(a3m, None) == a3m
+    assert limit_msa_depth(a3m, 0) == a3m
+
+    with tempfile.TemporaryDirectory() as td:
+        a3m_path = Path(td) / "m.a3m"
+        a3m_path.write_text(a3m)
+        inp = Path(td) / "in.json"
+        out_p = Path(td) / "out.json"
+        inp.write_text(
+            json.dumps(
+                {
+                    "sequences": [
+                        {
+                            "protein": {
+                                "id": "A",
+                                "sequence": "MKVLA",
+                                "unpairedMsaPath": str(a3m_path),
+                                "pairedMsa": a3m,
+                            }
+                        }
+                    ]
+                }
+            )
+        )
+        data = limit_json_msa_depth(inp, out_p, 2)
+        prot = data["sequences"][0]["protein"]
+        assert prot["unpairedMsa"].count(">") == 2
+        assert prot["pairedMsa"].count(">") == 2
+        assert "unpairedMsaPath" not in prot
+
+
+def test_get_gap_indicies_empty_and_from_matrix(test_data):
+    import numpy as np
+
+    from abcfold.output.utils import get_gap_indicies
+
+    assert get_gap_indicies() == []
+    cif_path = Path(test_data.test_alphafold3_6BJ9_) / "seed-1_sample-0" / "model.cif"
+    params_path = Path(test_data.test_alphafold3_6BJ9_) / "6bj9_data.json"
+    cif = CifFile(cif_path, json.loads(params_path.read_text()))
+    n = sum(cif.chain_lengths(mode="residues", ligand_atoms=True).values())
+    mat = np.zeros((n, n), dtype=float)
+    pae = Af3Pae.from_matrix(mat, cif)
+    assert len(pae.scores["pae"]) == n
+    assert len(pae.scores["token_chain_ids"]) == n

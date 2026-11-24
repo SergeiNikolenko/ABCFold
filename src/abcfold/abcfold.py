@@ -36,7 +36,8 @@ from abcfold.output.protenix import ProtenixOutput
 from abcfold.output.rosettafold3 import RosettafoldOutput
 from abcfold.report import (EngineRecord, build_report, samples_from_output,
                             write_report)
-from abcfold.scripts.abc_script_utils import (check_input_json, make_dir,
+from abcfold.scripts.abc_script_utils import (check_input_json,
+                                              limit_json_msa_depth, make_dir,
                                               make_dummy_af3_db, setup_logger)
 from abcfold.settings import Settings, load_settings
 
@@ -186,6 +187,13 @@ def run(args, settings: Optional[Settings] = None) -> int:
     args.output_dir = Path(args.output_dir)
     settings = resolve_settings(args, settings)
     rt_config = settings.runtime_config()
+
+    if getattr(args, "dry_run", False):
+        from abcfold.dry_run import setup_environments
+
+        setup_environments(args, settings)
+        return EXIT_OK
+
     args = raise_argument_errors(args)
 
     if args.mmseqs2:
@@ -250,14 +258,26 @@ def run(args, settings: Optional[Settings] = None) -> int:
             )
             input_params = json.loads(run_json.read_text())
 
+        max_msa_seqs = getattr(args, "max_msa_seqs", None)
+        if max_msa_seqs:
+            input_params = limit_json_msa_depth(
+                run_json, run_json, max_msa_seqs
+            )
+            logger.info("Limiting MSA depth to %d sequence(s)", max_msa_seqs)
+
         # An MSA that was requested but came back (nearly) empty would let every
         # backend fold single-sequence without noticing.
         from abcfold.msa.guard import (ShallowMsaError, check_input_msa_depth,
                                        min_msa_rows)
 
+        effective_min_rows = min_msa_rows(rt_config)
+        if max_msa_seqs and effective_min_rows > max_msa_seqs:
+            effective_min_rows = max_msa_seqs
+            rt_config["min_msa_rows"] = effective_min_rows
+
         precheck_error = None
         try:
-            check_input_msa_depth(input_params, min_msa_rows(rt_config),
+            check_input_msa_depth(input_params, effective_min_rows,
                                   context=str(run_json.name))
         except ShallowMsaError as exc:
             logger.error(str(exc))
@@ -333,7 +353,50 @@ def run(args, settings: Optional[Settings] = None) -> int:
                              record.error.splitlines()[0] if record.error else "")
             if engine == "alphafold3" and outcome.ok:
                 # AF3 may have produced MSAs that the other backends can reuse
-                input_params = json.loads(run_json.read_text())
+                if max_msa_seqs:
+                    input_params = limit_json_msa_depth(
+                        run_json, run_json, max_msa_seqs
+                    )
+                else:
+                    input_params = json.loads(run_json.read_text())
+
+        affinity_scores: Dict[str, Dict[str, Any]] = {}
+        if outputs and (
+            getattr(args, "ligand_smiles", None)
+            or getattr(args, "ligand_ccd", None)
+        ):
+            from abcfold.affinity.run_affinity import (extract_affinity_msa,
+                                                       run_boltz_affinity)
+            from abcfold.html.html_utils import get_all_cif_files
+
+            all_cifs = [
+                cif.pathway
+                for cif_list in get_all_cif_files(
+                    [out for _, out in outputs]
+                ).values()
+                for cif in cif_list
+            ]
+            affinity_msa = extract_affinity_msa(input_params, args.output_dir)
+            affinity_scores = run_boltz_affinity(
+                all_cifs,
+                args.output_dir,
+                smiles=args.ligand_smiles,
+                ccd=args.ligand_ccd,
+                ligand_chain=getattr(args, "ligand_chain", None),
+                msa=affinity_msa,
+                config=rt_config,
+                gpus=args.gpus,
+            )
+            if affinity_scores:
+                for rec in records.values():
+                    for sample in rec.samples:
+                        cand = str((args.output_dir / sample.cif).resolve())
+                        aff = affinity_scores.get(cand)
+                        if aff:
+                            sample.affinity_pred_value = aff.get("affinity_pred_value")
+                            sample.affinity_probability_binary = aff.get(
+                                "affinity_probability_binary"
+                            )
 
         report = build_report(
             name=name,
@@ -363,7 +426,13 @@ def run(args, settings: Optional[Settings] = None) -> int:
             logger.error("No models were generated")
             return exit_code
         try:
-            render_html(outputs, args.output_dir, no_server=args.no_server)
+            render_html(
+                outputs,
+                args.output_dir,
+                no_server=args.no_server,
+                affinity_scores=affinity_scores,
+                ccp4cloud=bool(getattr(args, "ccp4cloud", False)),
+            )
         except Exception as exc:
             logger.error("Could not build the HTML report: %s", exc)
             logger.debug(traceback.format_exc())
@@ -519,6 +588,7 @@ def _run_chai(args, rt_config, run_json, input_params, temp_dir, name):
         device=args.gpus,
         config=rt_config,
         diffusion_steps=args.diffusion_steps or 200,
+        mmseqs_database=args.mmseqs_database,
     )
     if not ok:
         return EngineOutcome(False)
@@ -654,8 +724,13 @@ def _run_esmfold2(args, rt_config, run_json, input_params, name):
     )
 
 
-def render_html(outputs: List[Tuple[str, ModelOutput]], output_dir: Path,
-                no_server: bool = False) -> None:
+def render_html(
+    outputs: List[Tuple[str, ModelOutput]],
+    output_dir: Path,
+    no_server: bool = False,
+    affinity_scores: Optional[Dict[str, Dict[str, Any]]] = None,
+    ccp4cloud: bool = False,
+) -> None:
     """Build the interactive HTML page (and optionally serve it)."""
     from abcfold.html.html_utils import (PORT, NoCacheHTTPRequestHandler,
                                          get_all_cif_files, get_model_data,
@@ -666,7 +741,11 @@ def render_html(outputs: List[Tuple[str, ModelOutput]], output_dir: Path,
     from abcfold.output.utils import get_gap_indicies, insert_none_by_minus_one
 
     model_outputs = [out for _, out in outputs]
-    plot_dict = plots(model_outputs, output_dir.joinpath(PLOTS_DIR))
+    plot_dict = plots(
+        model_outputs,
+        output_dir.joinpath(PLOTS_DIR),
+        include_pae=not ccp4cloud,
+    )
     cif_models = [
         cif_file
         for cif_list in get_all_cif_files(model_outputs).values()
@@ -698,6 +777,7 @@ def render_html(outputs: List[Tuple[str, ModelOutput]], output_dir: Path,
                 combined_models.append(get_model_data(
                     model, plot_dict, DISPLAY_NAMES[engine], plddt,
                     files["af3_pae"], score_file, output_dir,
+                    affinity_scores=affinity_scores,
                 ))
 
     prefix_by_display = {DISPLAY_NAMES[e]: MODEL_PREFIX[e] for e in DISPLAY_NAMES}
@@ -727,6 +807,7 @@ def render_html(outputs: List[Tuple[str, ModelOutput]], output_dir: Path,
         .relative_to(output_dir.resolve())
         .as_posix(),
         "chain_data": chain_data,
+        "ccp4cloud": bool(ccp4cloud),
     })
 
     if not output_dir.joinpath(".feature_viewer").exists():
@@ -748,6 +829,13 @@ def render_html(outputs: List[Tuple[str, ModelOutput]], output_dir: Path,
         version=abcfold_version() or "2",
     )
     logger.info(f"Output page written to {html_out}")
+    if ccp4cloud:
+        logger.info(
+            "ccp4cloud mode: local server disabled and model "
+            "visualisations column omitted"
+        )
+        return
+
     output_open_html_script(str(output_dir / "open_output.py"), port=PORT)
 
     if no_server:

@@ -1,10 +1,13 @@
+import contextlib
 import http.server
+import io
+import json
 import logging
 import textwrap
 from itertools import groupby
 from operator import itemgetter
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Tuple, Union
+from typing import Dict, FrozenSet, Iterable, List, Tuple, Union
 
 import numpy as np
 from Bio.SeqUtils import seq1
@@ -21,6 +24,11 @@ from abcfold.output.rosettafold3 import RosettafoldOutput
 from abcfold.plots.pae_plot import create_pae_plots
 from abcfold.plots.plddt_plot import plot_plddt
 from abcfold.scripts.ipsae import Ipsae
+
+try:
+    from reactifptm import Reactifptm
+except ImportError:  # pragma: no cover - optional dependency
+    Reactifptm = None
 
 PORT = 8000
 logger = logging.getLogger("logger")
@@ -49,7 +57,7 @@ def get_plddt_regions(plddts: Union[np.ndarray, list]) -> dict:
     return regions
 
 
-def get_regions_helper(indices: List[int]) -> List[Tuple[int, int]]:
+def get_regions_helper(indices: Iterable[int]) -> List[Tuple[int, int]]:
     """
     Get the regions from the indices
     """
@@ -112,7 +120,8 @@ def get_model_data(model,
                    plddt_scores,
                    pae_obj,
                    score_file,
-                   output_dir):
+                   output_dir,
+                   affinity_scores=None):
     """
     Get the model data for the output page
 
@@ -126,6 +135,8 @@ def get_model_data(model,
     """
     regions = get_plddt_regions(plddt_scores)
     ptm_score, iptm_score = parse_scores(score_file)
+    if sum(1 for _ in model.get_chains()) < 2:
+        iptm_score = None
     full_model_path = Path(model.pathway)
     model_path = full_model_path.relative_to(output_dir).as_posix()
 
@@ -153,6 +164,40 @@ def get_model_data(model,
                          verbose=False,
                          output_csv=ipsae_out)
 
+    reactifptm_score = []
+    if Reactifptm is not None:
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                pae_json = (
+                    full_model_path.parent
+                    / f"{Path(model_path).stem}_pae_af3.json"
+                )
+                with open(pae_json, "w") as fh:
+                    json.dump(ipsae.pae_data, fh)
+                try:
+                    reactif = Reactifptm(pae_json, full_model_path)
+                    reactif.compute_reactifptm()
+                    for pair, v in (reactif.reactifptm_pairwise_max or {}).items():
+                        pair_label = str(pair).replace("-", "")
+                        reactifptm_score.append(f"{pair_label}:{np.round(v, 4)}")
+                    reactif.save_results(
+                        full_model_path.parent
+                        / f"{Path(model_path).stem}_reactifptm.json"
+                    )
+                finally:
+                    pae_json.unlink(missing_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("reactifPTM failed for %s: %s", model.name, exc)
+
+    affinity = (affinity_scores or {}).get(str(full_model_path.resolve()), {})
+
+    pae_plot = plot_dict.get(model.pathway.as_posix())
+    pae_path = (
+        Path(pae_plot).relative_to(output_dir).as_posix()
+        if pae_plot is not None
+        else None
+    )
+
     model_data = {
         "model_id": model.name,
         "model_source": method,
@@ -163,11 +208,12 @@ def get_model_data(model,
         "ptm_score": ptm_score,
         "iptm_score": iptm_score,
         "ipsae_score": ",".join(ipsae_score),
+        "reactifptm_score": ",".join(reactifptm_score),
+        "affinity_pred_value": affinity.get("affinity_pred_value"),
+        "affinity_probability_binary": affinity.get("affinity_probability_binary"),
         "residue_clashes": model.clashes_residues,
         "atom_clashes": model.clashes,
-        "pae_path": Path(plot_dict[model.pathway.as_posix()])
-        .relative_to(output_dir)
-        .as_posix(),
+        "pae_path": pae_path,
     }
     return model_data
 
@@ -182,15 +228,19 @@ class NoCacheHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
 
-def plots(outputs: list, output_dir: Path):
+def plots(outputs: list, output_dir: Path, include_pae: bool = True):
     """
     Generate plots for the output of the different programs
 
     Args:
         outputs (list): List of output objects
+        output_dir (Path): Directory where plots are written
+        include_pae (bool): Generate PAE viewer HTML files (skipped in ccp4cloud)
 
     """
-    pathway_plots = create_pae_plots(outputs, output_dir=output_dir)
+    pathway_plots = (
+        create_pae_plots(outputs, output_dir=output_dir) if include_pae else {}
+    )
     plddt_plot_input: Dict[str, list] = get_all_cif_files(outputs)
 
     plot_plddt(plddt_plot_input, output_name=output_dir.joinpath("plddt_plot.html"))

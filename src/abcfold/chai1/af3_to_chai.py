@@ -1,14 +1,12 @@
 import hashlib
 import json
 import logging
-import textwrap
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from typing import Dict, List, Optional, Union
 
-import numpy as _  # noqa F401
+import numpy as _np  # noqa: F401
 import pandas as pd
-import pyarrow as _  # noqa F401
+import pyarrow as _pa  # noqa: F401
 import requests
 
 from abcfold.output.atoms import VANDERWALLS
@@ -333,7 +331,9 @@ check back for updates"
             else:
                 for lig in lig_ids:
                     ligand_str += (
-                        f">protein|{lig}\n{''.join([f'({ccd})' for ccd in ccd_codes])}\n"
+                        f">protein|{lig}\n"
+                        + ''.join([f'({ccd})' for ccd in ccd_codes])
+                        + "\n"
                     )
                     fasta_data[lig] = "CCD-CODE_PLACEHOLDER"
         if "smiles" in seq["ligand"]:

@@ -57,6 +57,7 @@ def run_chai_fast(
     template_hits_path: Path | None = None,
     device: str | None = None,
     diffusion_steps: int = 200,
+    mmseqs_database: Union[str, Path, None] = None,
 ) -> bool:
     return run_chai_batch(
         [input_json],
@@ -76,6 +77,7 @@ def run_chai_fast(
         nested_outputs=False,
         postprocess=False,
         diffusion_steps=diffusion_steps,
+        mmseqs_database=mmseqs_database,
     )
 
 
@@ -93,6 +95,7 @@ def run_chai_batch(
     nested_outputs: bool = True,
     postprocess: bool = True,
     diffusion_steps: int = 200,
+    mmseqs_database: Union[str, Path, None] = None,
 ) -> bool:
     input_paths = [Path(path) for path in input_jsons]
     if not input_paths:
@@ -104,9 +107,11 @@ def run_chai_batch(
     device_slots = normalize_devices(devices)
 
     env = None
+    kalign_available = True
     if not test:
         logger.debug("Checking if Chai-1 is installed")
         env = ensure_chai_env(config=config)
+        kalign_available = env.which("kalign")
 
     with tempfile.TemporaryDirectory() as temp_dir_str:
         temp_dir = Path(temp_dir_str)
@@ -119,6 +124,9 @@ def run_chai_batch(
             template_hits_paths=template_hits_paths,
             nested_outputs=nested_outputs,
             work_root=temp_dir,
+            mmseqs_database=mmseqs_database,
+            kalign_available=kalign_available,
+            test=test,
         )
         if test:
             logger.info("Skipping Chai fast backend execution in test mode")
@@ -192,6 +200,9 @@ def _prepare_tasks(
     template_hits_paths: dict[Path, Path | None] | None,
     nested_outputs: bool,
     work_root: Path,
+    mmseqs_database: Union[str, Path, None] = None,
+    kalign_available: bool = True,
+    test: bool = False,
 ) -> list[dict]:
     tasks = []
     for input_json in input_paths:
@@ -210,6 +221,31 @@ def _prepare_tasks(
         template_hits_path = (
             template_hits_paths.get(input_json) if template_hits_paths else None
         )
+        template_cif_store: Path | None = None
+        if not test:
+            from abcfold.chai1.chai_templates import prepare_chai_templates
+
+            combined_m8, template_cif_store = prepare_chai_templates(
+                input_params,
+                work_dir=working_dir,
+                existing_m8=template_hits_path,
+                mmseqs_database=mmseqs_database,
+            )
+            if combined_m8 is not None:
+                template_hits_path = combined_m8
+
+        task_use_templates_server = use_templates_server
+        wants_templates = (
+            task_use_templates_server or template_hits_path or template_cif_store
+        )
+        if not kalign_available and wants_templates:
+            logger.warning(
+                "kalign not found in the Chai-1 environment, skipping template "
+                "search. kalign is required for templates with Chai-1."
+            )
+            task_use_templates_server = False
+            template_hits_path = None
+            template_cif_store = None
 
         for seed in chai_fasta.seeds:
             seed_output_dir = case_output_dir / f"chai_output_seed-{seed}"
@@ -224,10 +260,15 @@ def _prepare_tasks(
                     "constraints": str(chai_fasta.constraints),
                     "output_dir": str(seed_output_dir),
                     "seed": seed,
-                    "use_templates_server": use_templates_server,
+                    "use_templates_server": task_use_templates_server,
                     "template_hits_path": (
                         str(template_hits_path)
                         if template_hits_path is not None
+                        else None
+                    ),
+                    "template_cif_store": (
+                        str(template_cif_store)
+                        if template_cif_store is not None
                         else None
                     ),
                 }
@@ -290,6 +331,9 @@ def _write_worker_script(work_root: Path) -> Path:
                 template_hits_path = task.get("template_hits_path")
                 if template_hits_path is not None:
                     template_hits_path = Path(template_hits_path)
+                template_cif_store = task.get("template_cif_store")
+                if template_cif_store is not None:
+                    template_cif_store = Path(template_cif_store)
                 run_inference_wrapper(
                     Path(task["fasta"]),
                     output_dir=output_dir,
@@ -297,6 +341,7 @@ def _write_worker_script(work_root: Path) -> Path:
                     constraint_path=constraint_path,
                     use_templates_server=task["use_templates_server"],
                     template_hits_path=template_hits_path,
+                    template_cif_store=template_cif_store,
                     num_trunk_recycles=task["num_recycles"],
                     num_diffn_timesteps=task.get("diffusion_steps", 200),
                     num_diffn_samples=task["number_of_models"],

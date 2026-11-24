@@ -145,6 +145,67 @@ def test_openfold_template_fetch_flag(test_data, tmp_path, flags, expected):
     args = abc.build_run_parser().parse_args(
         [test_data.test_inputA_json, str(tmp_path)] + flags)
     out = tmp_path / "runner.yaml"
-    OpenfoldJson(tmp_path).write_yaml(out, fetch_templates=args.openfold_fetch_templates)
+    OpenfoldJson(tmp_path).write_yaml(
+        out, fetch_templates=args.openfold_fetch_templates
+    )
     text = out.read_text()
     assert f"fetch_missing_structures: {str(expected).lower()}" in text.lower()
+
+
+def test_max_msa_seqs_caps_depth_and_guard(test_data, tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_boltz(args, rt_config, run_json, input_params, name):
+        seen["params"] = json.loads(Path(run_json).read_text())
+        return abc.EngineOutcome(True)
+
+    monkeypatch.setattr(abc, "_run_boltz", fake_boltz)
+    msa = tmp_path / "a.a3m"
+    data = json.loads(Path(test_data.test_inputA_json).read_text())
+    seq = data["sequences"][0]["protein"]["sequence"]
+    msa.write_text(
+        f">query\n{seq}\n"
+        + "".join(f">h{i}\n{seq[:-1]}{'ACDEFGHIKLMNPQ'[i]}\n" for i in range(12))
+    )
+    out = tmp_path / "out"
+    # max_msa_seqs=3 is below default min_msa_rows=10, must NOT trigger ShallowMsaError
+    code = run_cli([
+        test_data.test_inputA_json,
+        str(out),
+        "-b",
+        "--no_visuals",
+        "--msa",
+        "custom",
+        "--msa_a3m",
+        str(msa),
+        "--max_msa_seqs",
+        "3",
+    ])
+    assert code == abc.EXIT_OK
+    assert seen["params"]["sequences"][0]["protein"]["unpairedMsa"].count(">") == 3
+
+
+def test_dry_run_skips_output_dir_and_inference(test_data, tmp_path, monkeypatch):
+    called = []
+    monkeypatch.setattr(
+        "abcfold.dry_run.setup_environments",
+        lambda args, settings: called.append(args.boltz) or ["Boltz"],
+    )
+    out = tmp_path / "should_not_exist"
+    code = run_cli([test_data.test_inputA_json, str(out), "-b", "--dry_run"])
+    assert code == abc.EXIT_OK
+    assert called == [True]
+    assert not out.exists()
+
+
+def test_ligand_smiles_and_ccd_are_mutually_exclusive(test_data, tmp_path):
+    with pytest.raises(SystemExit):
+        run_cli([
+            test_data.test_inputA_json,
+            str(tmp_path / "out"),
+            "-b",
+            "--ligand_smiles",
+            "CCO",
+            "--ligand_ccd",
+            "ATP",
+        ])

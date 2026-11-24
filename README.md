@@ -147,6 +147,25 @@ process setup overhead and distributing seed jobs across the requested
 `--gpus` slots. `--chai_fast` was intentionally removed; use `--chai1`.
 See [Chai Fast Runner](docs/chai_fast_runner.md) for smoke checks and details.
 
+#### Boltz-2 affinity scoring
+
+ABCFold can score the binding affinity of predicted protein-ligand complexes
+with the Boltz-2 affinity head (via Boltzina). Affinity scoring is **off by
+default** and is enabled by passing `--ligand_smiles` or `--ligand_ccd`. Every
+predicted complex across all selected backends is scored in one batched pass,
+reusing the run MSA when available, and the results appear in `report.json`
+and the HTML report table (`Boltz-2 affinity` and `Boltz-2 binder prob.`).
+
+- `--ligand_smiles`: [optional] Ligand SMILES to score with the Boltz-2 affinity head.
+- `--ligand_ccd`: [optional] Ligand CCD code to score (alternative to `--ligand_smiles`).
+- `--ligand_chain`: [optional] Restrict affinity scoring to this chain (auto-detected if omitted).
+
+#### MSA depth, dry-run and template options
+
+- `--max_msa_seqs`: [optional] Limit every protein MSA to at most this many sequences (useful alongside templates).
+- `--boltz_template_threshold`: [optional] Enforce Boltz templates (`force: true`) within this distance threshold in Angstroms (soft templates by default).
+- `--dry_run`: [optional] Prepare and smoke-check selected predictor environments and checkpoints without running inference.
+
 #### Template arguments
 
 - `--templates`: Flag to enable a template search
@@ -159,6 +178,7 @@ See [Chai Fast Runner](docs/chai_fast_runner.md) for smoke checks and details.
 #### Visualisation arguments
 - `--no_server`: [optional] Flag to not run the server for the output page (see below) but the pages are created , useful for running on a cluster.
 - `--no_visuals`: [optional] Flag to not generate any output pages or PAE plots and only output the models.
+- `--ccp4cloud`: [optional] Produce an output page for services where a local server cannot run (skips PAE viewer HTML generation, hides visualisations column, and disables local server).
 
 #### Custom template usage
 

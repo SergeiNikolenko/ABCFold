@@ -128,7 +128,7 @@ def test_client_unpaired_maps_queries_back():
     })
     client = ColabFoldClient("http://msa.test/", session=session,
                              sleep=lambda s: None)
-    # The server numbers unique queries from 101 in submission order: SEQ_A -> 101, SEQ_B -> 102.
+    # Server numbers unique queries from 101: SEQ_A -> 101, SEQ_B -> 102.
     out = client.unpaired([SEQ_A, SEQ_B, SEQ_A])
     # duplicates are submitted once
     assert session.posts[0][1]["q"].count(">") == 2
