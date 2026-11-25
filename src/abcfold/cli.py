@@ -111,6 +111,21 @@ def _batch_main(argv: List[str]) -> int:
     parser.add_argument("--msa_server_url")
     parser.add_argument("--force", action="store_true",
                         help="Re-run jobs that already completed")
+    parser.add_argument(
+        "--no-batched",
+        dest="batched",
+        action="store_false",
+        default=True,
+        help="Disable phase-separated GPU batching and run one subprocess per job",
+    )
+    parser.add_argument(
+        "--workers-per-gpu",
+        "--workers_per_gpu",
+        dest="workers_per_gpu",
+        type=int,
+        default=None,
+        help="Concurrent worker processes per GPU (default: auto from free VRAM)",
+    )
     parser.add_argument("--config-file", dest="config_file")
     if "--" in argv:
         split = argv.index("--")
@@ -136,7 +151,8 @@ def _batch_main(argv: List[str]) -> int:
     status = run_batch(
         args.manifest, args.output_dir, max_parallel=args.max_parallel,
         gpus=args.gpus, msa=args.msa, msa_options=options, run_args=run_args,
-        force=args.force,
+        force=args.force, batched=args.batched,
+        workers_per_gpu=args.workers_per_gpu,
     )
     counts = status.get("counts", {})
     logger.info("Batch finished: %s", counts)

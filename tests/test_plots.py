@@ -54,7 +54,7 @@ def test_pae_plots(output_objs):
         assert len(plot_pathways) == 10
         values = [Path(value).name for value in plot_pathways.values()]
 
-        # PAE is converted to a separate <model>_af3_pae.json per model (inputs are never rewritten in place).
+        # PAE is written to <model>_af3_pae.json (never rewriting inputs).
         assert sorted(values) == [
             "6BJ9_sample_0_af3_pae_predictions_af3_pae_plot.html",
             "6BJ9_sample_1_af3_pae_predictions_af3_pae_plot.html",

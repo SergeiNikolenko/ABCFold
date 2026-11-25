@@ -26,6 +26,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+_TEMPLATE_CACHE: dict[str, tuple[str, str]] = {}
+
 
 def resolved_path(value: str) -> Path:
     path = Path(value).resolve()
@@ -90,7 +92,7 @@ def get_session_data(
 def create_session_json_element(value: Any) -> str:
     return (
         '    <script type="application/json" id="session-data">\n'
-        f"        {json.dumps(value)}\n"
+        f"        {json.dumps(value, ensure_ascii=False, separators=(',', ':'))}\n"
         "    </script>"
     )
 
@@ -113,16 +115,23 @@ def create_session_file(
     session_path.touch()
 
     pae_template = str(template_file)
-    with (
-        open(pae_template, "r") as template_file_obj,
-        open(session_path, "w") as session_file,
-    ):
-        template = template_file_obj.read()
-        template = template.replace(
-            "</head>", f"\n{create_session_json_element(data)}\n</head>"
-        )
-
-        session_file.write(template)
+    split = _TEMPLATE_CACHE.get(pae_template)
+    if split is None:
+        tpl = Path(pae_template).read_text()
+        head_idx = tpl.find("</head>")
+        if head_idx != -1:
+            split = (tpl[:head_idx], tpl[head_idx:])
+        else:
+            split = (tpl, "")
+        _TEMPLATE_CACHE[pae_template] = split
+    prefix, suffix = split
+    with open(session_path, "w") as session_file:
+        session_file.write(prefix)
+        if suffix:
+            session_file.write("\n")
+            session_file.write(create_session_json_element(data))
+            session_file.write("\n")
+            session_file.write(suffix)
 
     return session_path
 

@@ -110,6 +110,8 @@ class SampleRecord:
     chain_ids: List[str] = field(default_factory=list)
     status: str = "ok"
     seconds: Optional[float] = None
+    affinity_pred_value: Optional[float] = None
+    affinity_probability_binary: Optional[float] = None
 
 
 @dataclass
@@ -269,7 +271,8 @@ def validate_report(report: Mapping) -> List[str]:
         if missing:
             errors.append(f"samples[{i}]: missing {missing}")
         for key in ("score", "ptm", "iptm", "plddt", "ligand_plddt", "ligand_pae",
-                    "seconds"):
+                    "seconds", "affinity_pred_value",
+                    "affinity_probability_binary"):
             value = sample.get(key)
             if value is not None and not isinstance(value, (int, float)):
                 errors.append(f"samples[{i}].{key} is not numeric")

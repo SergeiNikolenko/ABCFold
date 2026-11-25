@@ -61,3 +61,9 @@ def test_generate_protenix_command(test_data):
         assert "42" in cmd
         assert "--use_msa" in cmd
         assert "True" in cmd
+
+
+def test_generate_protenix_test_command():
+    from abcfold.protenix.run_protenix import generate_protenix_test_command
+
+    assert generate_protenix_test_command() == ["protenix", "pred", "--help"]

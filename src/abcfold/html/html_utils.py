@@ -1,10 +1,13 @@
+import contextlib
 import http.server
+import io
+import threading
 import logging
 import textwrap
 from itertools import groupby
 from operator import itemgetter
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Tuple, Union
+from typing import Dict, FrozenSet, Iterable, List, Tuple, Union
 
 import numpy as np
 from Bio.SeqUtils import seq1
@@ -22,8 +25,90 @@ from abcfold.plots.pae_plot import create_pae_plots
 from abcfold.plots.plddt_plot import plot_plddt
 from abcfold.scripts.ipsae import Ipsae
 
+try:
+    from reactifptm import Reactifptm
+except ImportError:  # pragma: no cover - optional dependency
+    Reactifptm = None
+
 PORT = 8000
 logger = logging.getLogger("logger")
+_STDOUT_LOCK = threading.Lock()
+
+
+def _run_reactifptm_in_memory(
+    pae_data: dict,
+    model_path: Path,
+    pae_json_fallback: Path | None,
+):
+    """Run Reactifptm directly from the in-memory PAE dict (zero disk re-read)."""
+    assert Reactifptm is not None
+    raw_pae = (
+        pae_data.get("predicted_aligned_error")
+        if isinstance(pae_data, dict) and "predicted_aligned_error" in pae_data
+        else (pae_data.get("pae") if isinstance(pae_data, dict) else None)
+    )
+    if raw_pae is None:
+        if pae_json_fallback is None:
+            raise ValueError("PAE matrix missing for reactifPTM")
+        r = Reactifptm(pae_json_fallback, model_path)
+        r.compute_reactifptm()
+        return r
+
+    pae_arr = np.asarray(raw_pae, dtype=np.float64)
+    tok_chains = pae_data.get("token_chain_ids") if isinstance(pae_data, dict) else None
+    tok_res = pae_data.get("token_res_ids") if isinstance(pae_data, dict) else None
+
+    class _FastReactifptm(Reactifptm):  # type: ignore[misc,valid-type]
+        def parse_pae_file(self, _pae_path):
+            self._token_chain_ids = tok_chains
+            self._token_res_ids = tok_res
+            return pae_arr
+
+        def _score(
+            self,
+            tm_matrix,
+            pair_mask,
+            asym_id,
+            interface=False,
+            contacts=None,
+            row_chain=None,
+        ):
+            # Fast equivalent avoiding dense O(N^2) pair_mask.copy() and zero-row ops.
+            if row_chain is not None:
+                rows = asym_id == row_chain
+                if not rows.any():
+                    return np.nan
+                cols = (asym_id != row_chain) if interface else np.ones_like(rows)
+                if not cols.any():
+                    return np.nan
+                sub_tm = tm_matrix[np.ix_(rows, cols)]
+                if contacts is not None:
+                    sub_mask = contacts[np.ix_(rows, cols)]
+                else:
+                    sub_mask = pair_mask[np.ix_(rows, cols)]
+                row_sums = sub_mask.sum(axis=-1)
+                if not np.any(row_sums):
+                    return np.nan
+                active = row_sums > 0
+                per_row = np.sum(sub_tm[active] * sub_mask[active], axis=-1) / (
+                    1e-8 + row_sums[active]
+                )
+                return float(per_row.max())
+            mask = contacts if contacts is not None else pair_mask
+            if interface:
+                mask = mask * (asym_id[:, None] != asym_id[None, :])
+            row_sums = mask.sum(axis=-1)
+            if not np.any(row_sums):
+                return np.nan
+            active = row_sums > 0
+            per_row = np.sum(tm_matrix[active] * mask[active], axis=-1) / (
+                1e-8 + row_sums[active]
+            )
+            return float(per_row.max())
+
+    r = _FastReactifptm(model_path, model_path)
+    r.compute_reactifptm()
+    return r
 
 
 def get_plddt_regions(plddts: Union[np.ndarray, list]) -> dict:
@@ -49,7 +134,7 @@ def get_plddt_regions(plddts: Union[np.ndarray, list]) -> dict:
     return regions
 
 
-def get_regions_helper(indices: List[int]) -> List[Tuple[int, int]]:
+def get_regions_helper(indices: Iterable[int]) -> List[Tuple[int, int]]:
     """
     Get the regions from the indices
     """
@@ -112,7 +197,8 @@ def get_model_data(model,
                    plddt_scores,
                    pae_obj,
                    score_file,
-                   output_dir):
+                   output_dir,
+                   affinity_scores=None):
     """
     Get the model data for the output page
 
@@ -126,6 +212,8 @@ def get_model_data(model,
     """
     regions = get_plddt_regions(plddt_scores)
     ptm_score, iptm_score = parse_scores(score_file)
+    if sum(1 for _ in model.get_chains()) < 2:
+        iptm_score = None
     full_model_path = Path(model.pathway)
     model_path = full_model_path.relative_to(output_dir).as_posix()
 
@@ -153,6 +241,41 @@ def get_model_data(model,
                          verbose=False,
                          output_csv=ipsae_out)
 
+    reactifptm_score = []
+    if Reactifptm is not None:
+        try:
+            pae_existing = getattr(pae_obj, "pathway", None)
+            existing_path = Path(pae_existing) if pae_existing is not None else None
+            reuse_existing = (
+                existing_path is not None
+                and existing_path.is_file()
+                and existing_path.suffix == ".json"
+            )
+            reactif = _run_reactifptm_in_memory(
+                ipsae.pae_data,
+                full_model_path,
+                existing_path if reuse_existing else None,
+            )
+            for pair, v in (reactif.reactifptm_pairwise_max or {}).items():
+                pair_label = str(pair).replace("-", "")
+                reactifptm_score.append(f"{pair_label}:{np.round(v, 4)}")
+            with _STDOUT_LOCK, contextlib.redirect_stdout(io.StringIO()):
+                reactif.save_results(
+                    full_model_path.parent
+                    / f"{Path(model_path).stem}_reactifptm.json"
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("reactifPTM failed for %s: %s", model.name, exc)
+
+    affinity = (affinity_scores or {}).get(str(full_model_path.resolve()), {})
+
+    pae_plot = plot_dict.get(model.pathway.as_posix())
+    pae_path = (
+        Path(pae_plot).relative_to(output_dir).as_posix()
+        if pae_plot is not None
+        else None
+    )
+
     model_data = {
         "model_id": model.name,
         "model_source": method,
@@ -163,11 +286,12 @@ def get_model_data(model,
         "ptm_score": ptm_score,
         "iptm_score": iptm_score,
         "ipsae_score": ",".join(ipsae_score),
+        "reactifptm_score": ",".join(reactifptm_score),
+        "affinity_pred_value": affinity.get("affinity_pred_value"),
+        "affinity_probability_binary": affinity.get("affinity_probability_binary"),
         "residue_clashes": model.clashes_residues,
         "atom_clashes": model.clashes,
-        "pae_path": Path(plot_dict[model.pathway.as_posix()])
-        .relative_to(output_dir)
-        .as_posix(),
+        "pae_path": pae_path,
     }
     return model_data
 
@@ -182,15 +306,19 @@ class NoCacheHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
 
-def plots(outputs: list, output_dir: Path):
+def plots(outputs: list, output_dir: Path, include_pae: bool = True):
     """
     Generate plots for the output of the different programs
 
     Args:
         outputs (list): List of output objects
+        output_dir (Path): Directory where plots are written
+        include_pae (bool): Generate PAE viewer HTML files (skipped in ccp4cloud)
 
     """
-    pathway_plots = create_pae_plots(outputs, output_dir=output_dir)
+    pathway_plots = (
+        create_pae_plots(outputs, output_dir=output_dir) if include_pae else {}
+    )
     plddt_plot_input: Dict[str, list] = get_all_cif_files(outputs)
 
     plot_plddt(plddt_plot_input, output_name=output_dir.joinpath("plddt_plot.html"))

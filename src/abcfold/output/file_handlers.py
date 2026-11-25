@@ -3,12 +3,15 @@ import logging
 import re
 import warnings
 from abc import ABC
+from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-from Bio.PDB import MMCIFIO, Chain, MMCIFParser, Model
+from Bio.PDB import MMCIFParser, Model
+from Bio.PDB.StructureBuilder import StructureBuilder
+from Bio.PDB.Chain import Chain
 from Bio.PDB.Atom import Atom
 from Bio.PDB.kdtrees import KDTree
 from Bio.PDB.Polypeptide import is_aa
@@ -18,9 +21,165 @@ from Bio.SeqUtils import seq1
 
 from abcfold.output.atoms import VANDERWALLS
 
+try:
+    from scipy.spatial import cKDTree as _ScipyKDTree
+except ImportError:  # pragma: no cover - optional dependency
+    _ScipyKDTree = None  # type: ignore[assignment]
+_gemmi: Any
+try:
+    import gemmi as _gemmi
+except ImportError:  # pragma: no cover - optional dependency
+    _gemmi = None
+
 warnings.filterwarnings("ignore")
 
 logger = logging.getLogger("logger")
+_SINGLE_QUOTE_ATOM_RE = re.compile(r"'(\w+)'{2}")
+
+
+def _load_structure_fast(struct_id: str, cif_path: Path):
+    """Load an mmCIF into a BioPython Structure using gemmi's C++ parser when available.
+
+    Falls back to BioPython's MMCIFParser if gemmi is absent or if the file
+    has an unusual layout.
+    """
+    if _gemmi is not None:
+        try:
+            st = _gemmi.read_structure(str(cif_path))
+            if len(st) > 0:
+                sb = StructureBuilder()
+                sb.init_structure(struct_id)
+                for m_idx, model in enumerate(st):
+                    sb.init_model(m_idx)
+                    for chain in model:
+                        sb.init_chain(chain.name)
+                        sb.init_seg("    ")
+                        for res in chain:
+                            if res.is_water():
+                                hetflag = "W"
+                            elif res.het_flag == "H":
+                                hetflag = f"H_{res.name}"
+                            else:
+                                hetflag = " "
+                            ic = res.seqid.icode
+                            icode = ic if ic not in ("\x00", "") else " "
+                            seq_num = 0 if res.seqid.num is None else int(res.seqid.num)
+                            sb.init_residue(res.name, hetflag, seq_num, icode)
+                            for atom in res:
+                                al = atom.altloc
+                                alt = al if al not in ("\x00", "") else " "
+                                name = atom.name
+                                fullname = f" {name:<3s}" if len(name) < 4 else name
+                                ename = atom.element.name
+                                elem = ename.upper() if ename else ""
+                                pos = atom.pos
+                                xyz = np.array([pos.x, pos.y, pos.z], dtype=np.float64)
+                                sb.init_atom(
+                                    name,
+                                    xyz,
+                                    float(atom.b_iso),
+                                    float(atom.occ),
+                                    alt,
+                                    fullname,
+                                    serial_number=int(atom.serial),
+                                    element=elem,
+                                )
+                return sb.get_structure()
+        except Exception:  # noqa: BLE001
+            pass
+    parser = MMCIFParser(QUIET=True)
+    return parser.get_structure(struct_id, cif_path)
+
+
+def _cif_quote(val: str) -> str:
+    if not val:
+        return "."
+    if "'" in val:
+        return f'"{val}"'
+    if '"' in val or " " in val or "\t" in val:
+        return f"'{val}'"
+    return val
+
+
+def _write_mmcif_single_pass(
+    structure,
+    output_file: Union[str, Path],
+    *,
+    ligand_chains: Optional[set] = None,
+    use_chain_as_label_asym: bool = True,
+) -> None:
+    """Write a BioPython Structure to mmCIF in a single buffered pass.
+
+    Emits the exact 18-column _atom_site loop matching BioPython's MMCIFIO
+    column order (so fields[10..12] are Cartn_x/y/z at %.3f) while avoiding
+    MMCIFIO's triple disk write and per-token Python quoting overhead.
+    """
+    ligand_set = ligand_chains or set()
+    raw_id = getattr(structure, "id", "structure") or "structure"
+    data_id = str(raw_id).replace(" ", "_")
+    lines = [
+        f"data_{data_id}",
+        "#",
+        "loop_",
+        "_atom_site.group_PDB",
+        "_atom_site.id",
+        "_atom_site.type_symbol",
+        "_atom_site.label_atom_id",
+        "_atom_site.label_alt_id",
+        "_atom_site.label_comp_id",
+        "_atom_site.label_asym_id",
+        "_atom_site.label_entity_id",
+        "_atom_site.label_seq_id",
+        "_atom_site.pdbx_PDB_ins_code",
+        "_atom_site.Cartn_x",
+        "_atom_site.Cartn_y",
+        "_atom_site.Cartn_z",
+        "_atom_site.occupancy",
+        "_atom_site.B_iso_or_equiv",
+        "_atom_site.auth_seq_id",
+        "_atom_site.auth_asym_id",
+        "_atom_site.pdbx_PDB_model_num",
+    ]
+    append = lines.append
+    atom_idx = 0
+    for model_num, model in enumerate(structure, start=1):
+        entity_idx = 0
+        for chain in model:
+            entity_idx += 1
+            cid = str(chain.id)
+            is_lig = cid in ligand_set
+            label_asym = cid if use_chain_as_label_asym else cid
+            seq_counter = 0
+            for residue in chain:
+                hetflag, resseq, icode = residue.id
+                is_het = is_lig or (hetflag != " ")
+                group = "HETATM" if is_het else "ATOM"
+                resname = _cif_quote(str(residue.resname).strip())
+                if not is_het:
+                    seq_counter += 1
+                    label_seq = str(seq_counter)
+                else:
+                    label_seq = "."
+                ins_code = "?" if icode in (" ", "", None) else str(icode)
+                auth_seq = str(resseq)
+                for atom in residue:
+                    atom_idx += 1
+                    elem = str(atom.element or "C").strip() or "C"
+                    aname = _cif_quote(str(atom.get_name()).strip())
+                    alt = atom.get_altloc()
+                    alt_str = "." if alt in (" ", "", None) else str(alt)
+                    x, y, z = atom.get_coord()
+                    occ = atom.get_occupancy()
+                    occ_val = 1.0 if occ is None else float(occ)
+                    bfac = float(atom.get_bfactor())
+                    append(
+                        f"{group} {atom_idx} {elem} {aname} {alt_str} {resname} "
+                        f"{label_asym} {entity_idx} {label_seq} {ins_code} "
+                        f"{x:.3f} {y:.3f} {z:.3f} {occ_val:.2f} {bfac:.2f} "
+                        f"{auth_seq} {cid} {model_num}"
+                    )
+    append("#")
+    Path(output_file).write_text("\n".join(lines) + "\n")
 
 
 class FileTypes(Enum):
@@ -184,6 +343,7 @@ class CifFile(FileBase):
         self.__plddts: Optional[List[float]] = None
         self.__residue_plddts: Optional[List[float]] = None
         self.__h_score: Optional[float] = None
+        self._clash_cache: dict = {}
         self.__name: str = self.cif_file.stem
 
     @property
@@ -202,9 +362,12 @@ class CifFile(FileBase):
         """
         The pLDDT scores for each atom in the model
         """
-        self.__plddts = [
-            plddts for plddts in self.get_plddt_per_atom().values() for plddts in plddts
-        ]
+        if self.__plddts is None:
+            self.__plddts = [
+                plddts
+                for plddts in self.get_plddt_per_atom().values()
+                for plddts in plddts
+            ]
         return self.__plddts
 
     @property
@@ -212,12 +375,12 @@ class CifFile(FileBase):
         """
         The pLDDT scores for each residue in the model
         """
-
-        self.__residue_plddts = [
-            plddts
-            for plddts in self.get_plddt_per_residue().values()
-            for plddts in plddts
-        ]
+        if self.__residue_plddts is None:
+            self.__residue_plddts = [
+                plddts
+                for plddts in self.get_plddt_per_residue().values()
+                for plddts in plddts
+            ]
         return self.__residue_plddts
 
     @property
@@ -247,8 +410,7 @@ class CifFile(FileBase):
         """
         Load the cif file using BioPython
         """
-        parser = MMCIFParser(QUIET=True)
-        return parser.get_structure(self.pathway.stem, self.pathway)
+        return _load_structure_fast(self.pathway.stem, self.pathway)
 
     def get_chains(self):
         return self.model[0]
@@ -596,12 +758,20 @@ class CifFile(FileBase):
         assert old_chain_label_counter == len(
             self.get_chains()
         ), "Number of chain ids must match the number of chains"
+        self._invalidate_caches()
         if persist:
             self.update()
 
+    def _invalidate_caches(self) -> None:
+        self.__plddts = None
+        self.__residue_plddts = None
+        self.__ligand_plddts = None
+        self.__h_score = None
+        self._clash_cache = {}
+
     def update(self):
+        self._invalidate_caches()
         self.to_file(self.pathway)
-        self = CifFile(self.pathway, self.input_params)
 
     def reorder_chains(self, new_chain_ids: List[str]):
 
@@ -633,55 +803,96 @@ for reordering"
             A list of clashes.
 
         """
-        atoms = self.get_atoms()
-        coords = np.array(
-            [atom.get_coord() for atom in atoms],
-            dtype="d",
-        )
         assert bucket > 1
-        assert coords.shape[1] == 3
         assert clash_cutoff > 0.0 and clash_cutoff <= 1.0
 
-        tree = KDTree(coords, bucket)
-        neighbors = tree.neighbor_search(threshold)
-        clashes_atoms, clashes_residues = [], []
+        cache_key = (float(threshold), int(bucket), float(clash_cutoff))
+        cached = self._clash_cache.get(cache_key)
+        if cached is not None:
+            cached_atoms, cached_residues = cached
+            self.clashes = len(cached_atoms)
+            self.clashes_residues = len(cached_residues)
+            return cached
 
-        for neighbor in neighbors:
-            i1, i2 = neighbor.index1, neighbor.index2
-            atom1, atom2 = atoms[i1], atoms[i2]
-            # get the element of the atom
-            element1 = atom1.element
-            element2 = atom2.element
-            # find chain_id and residue_id
-            chain_id1 = atom1.get_full_id()[2]
-            chain_id2 = atom2.get_full_id()[2]
+        atoms: List[Atom] = []
+        chain_indices: List[int] = []
+        vdw_radii: List[float] = []
+        for c_idx, chain in enumerate(self.model[0]):
+            for atom in chain.get_atoms():
+                atoms.append(atom)
+                chain_indices.append(c_idx)
+                vdw_radii.append(VANDERWALLS.get(atom.element, 1.7))
 
-            if chain_id1 == chain_id2:
-                continue
+        if len(atoms) < 2:
+            self.clashes = 0
+            self.clashes_residues = 0
+            result: Tuple[List[Tuple[Atom, Atom]], List[Tuple[Residue, Residue]]] = (
+                [],
+                [],
+            )
+            self._clash_cache[cache_key] = result
+            return result
 
-            distance = np.linalg.norm(atom1.get_coord() - atom2.get_coord())
-            if (atom1.name == "C" and atom1.name == "N") or (
-                atom2.name == "N" and atom1.name == "C"
-            ):
-                continue
-            elif (atom1.name == "SG" and atom2.name == "SG") and distance > 1.88:
-                continue
+        coords = np.asarray([atom.get_coord() for atom in atoms], dtype=np.float64)
+        assert coords.shape[1] == 3
 
-            clash_radius = (
-                VANDERWALLS.get(element1, 1.7) + VANDERWALLS.get(element2, 1.7)
-            ) * 0.63
-            if distance < clash_radius:
+        if _ScipyKDTree is not None:
+            tree = _ScipyKDTree(coords, leafsize=bucket)
+            pairs = tree.query_pairs(r=float(threshold), output_type="ndarray")
+        else:
+            tree = KDTree(coords, bucket)
+            neighbors = tree.neighbor_search(threshold)
+            pairs = (
+                np.asarray(
+                    [(n.index1, n.index2) for n in neighbors], dtype=np.int32
+                )
+                if neighbors
+                else np.empty((0, 2), dtype=np.int32)
+            )
+
+        clashes_atoms: List[Tuple[Atom, Atom]] = []
+        clashes_residues: List[Tuple[Residue, Residue]] = []
+        seen_residues: set = set()
+
+        if len(pairs) > 0:
+            chain_arr = np.asarray(chain_indices, dtype=np.int32)
+            diff_chain = chain_arr[pairs[:, 0]] != chain_arr[pairs[:, 1]]
+            pairs = pairs[diff_chain]
+
+        if len(pairs) > 0:
+            i1_arr = pairs[:, 0]
+            i2_arr = pairs[:, 1]
+            deltas = coords[i1_arr] - coords[i2_arr]
+            dists = np.sqrt(np.einsum("ij,ij->i", deltas, deltas))
+            vdw_arr = np.asarray(vdw_radii, dtype=np.float64)
+            radii = (vdw_arr[i1_arr] + vdw_arr[i2_arr]) * clash_cutoff
+            hit_idx = np.flatnonzero(dists < radii)
+
+            for k in hit_idx:
+                atom1 = atoms[int(i1_arr[k])]
+                atom2 = atoms[int(i2_arr[k])]
+                distance = float(dists[k])
+                if (atom1.name == "C" and atom2.name == "N") or (
+                    atom1.name == "N" and atom2.name == "C"
+                ):
+                    continue
+                if atom1.name == "SG" and atom2.name == "SG" and distance > 1.88:
+                    continue
+
                 residue1 = atom1.get_parent()
                 residue2 = atom2.get_parent()
-
                 clashes_atoms.append((atom1, atom2))
-
-                if (residue1, residue2) not in clashes_residues:
-                    clashes_residues.append((residue1, residue2))
+                if residue1 is not None and residue2 is not None:
+                    res_pair = (residue1, residue2)
+                    if res_pair not in seen_residues:
+                        seen_residues.add(res_pair)
+                        clashes_residues.append(res_pair)
 
         self.clashes = len(clashes_atoms)
         self.clashes_residues = len(clashes_residues)
-        return (clashes_atoms, clashes_residues)
+        result = (clashes_atoms, clashes_residues)
+        self._clash_cache[cache_key] = result
+        return result
 
     def get_atoms(self, chain_id=None) -> list:
         """
@@ -713,17 +924,15 @@ for reordering"
         Returns:
             None
         """
-        io = MMCIFIO()
-        io.set_structure(self.model)
-
-        # save creates the dictionary
-        io.save(str(output_file))
-        self.__atom_site_label_update(io.dic)
-        self.__ligand_to_hetatm(io.dic)
-        with open(output_file, "w") as f:
-            io._save_dict(f)
-
-        self.__single_to_double_quotes(output_file)
+        ligand_chains = {
+            chain.id for chain in self.get_chains() if self.check_ligand(chain)
+        }
+        _write_mmcif_single_pass(
+            self.model,
+            output_file,
+            ligand_chains=ligand_chains,
+            use_chain_as_label_asym=True,
+        )
 
     def __single_to_double_quotes(self, file_name: Union[str, Path]) -> None:
         new_lines = []
@@ -858,24 +1067,25 @@ for reordering"
         """
         rosettafold_path = Path(rosettafold_cif)
         tmp_path = rosettafold_path.parent / f"{rosettafold_path.stem}_fixed.cif"
-        parser = MMCIFParser(QUIET=True)
-        model = parser.get_structure(rosettafold_path.stem, rosettafold_path)
+        model = _load_structure_fast(rosettafold_path.stem, rosettafold_path)
         for atom in model.get_atoms():
             atom.bfactor = atom.bfactor * 100.0
-        io = MMCIFIO()
-        io.set_structure(model)
-        io.save(str(tmp_path))
+        _write_mmcif_single_pass(model, tmp_path)
 
         return cls(str(tmp_path), input_params)
 
 
 class ConfidenceJsonFile(FileBase):
-    def __init__(self, json_file: Union[str, Path]):
+    def __init__(
+        self, json_file: Union[str, Path], data: Optional[dict] = None
+    ):
         """
         Object to handle json files
 
         Args:
             json_file (Union[str, Path]): Path to the json file
+            data (Optional[dict]): Preloaded JSON dictionary to avoid a
+                redundant disk read when the caller already built it in memory.
 
         Attributes:
             json_file (Path): Path to the json file
@@ -883,7 +1093,17 @@ class ConfidenceJsonFile(FileBase):
 
         """
         super().__init__(json_file)
-        self.data = self.load_json_file()
+        self._data = data
+
+    @property
+    def data(self):
+        if self._data is None:
+            self._data = self.load_json_file()
+        return self._data
+
+    @data.setter
+    def data(self, value):
+        self._data = value
 
     def load_json_file(self):
         # load the json file
@@ -903,44 +1123,42 @@ def superpose_models(models_list: List[Union[str, Path]]) -> None:
     Returns:
         None
     """
-
-    parser = MMCIFParser(QUIET=True)
-    structure = parser.get_structure(Path(models_list[0]).stem, Path(models_list[0]))
+    if len(models_list) < 2:
+        return
+    ref_path = Path(models_list[0])
+    structure = _load_structure_fast(ref_path.stem, ref_path)
     ref_model = structure[0]
+    ref_chains = list(ref_model)
 
-    for model in models_list[1:]:
-        alt_structure = parser.get_structure(Path(model).stem, Path(model))
+    def _superpose_one(model_path: Union[str, Path]) -> None:
+        mpath = Path(model_path)
+        alt_structure = _load_structure_fast(mpath.stem, mpath)
         alt_model = alt_structure[0]
 
         ref_atoms = []
         alt_atoms = []
-        for (ref_chain, alt_chain) in zip(ref_model, alt_model):
+        for ref_chain, alt_chain in zip(ref_chains, alt_model):
             for ref_res, alt_res in zip(ref_chain, alt_chain):
-                if ref_res.resname != alt_res.resname or ref_res.id != alt_res.id:
-                    pass
-
-                # Handle nucleotides and proteins differently
-                if ref_res.resname in ["DA", "DT", "DG", "DC"]:
+                if ref_res.resname in ("DA", "DT", "DG", "DC", "A", "U", "G", "C", "T"):
                     ref_atoms.append(ref_res["C1'"])
                     alt_atoms.append(alt_res["C1'"])
-                elif ref_res.resname in ["A", "U", "G", "C", "T"]:
-                    ref_atoms.append(ref_res["C1'"])
-                    alt_atoms.append(alt_res["C1'"])
-                elif 'CA' in ref_res:
-                    ref_atoms.append(ref_res['CA'])
-                    alt_atoms.append(alt_res['CA'])
-                else:  # Ignore anything else
-                    pass
+                elif "CA" in ref_res:
+                    ref_atoms.append(ref_res["CA"])
+                    alt_atoms.append(alt_res["CA"])
 
         if len(ref_atoms) == 0 or len(alt_atoms) == 0:
             logger.warning(
-                f"No matching atoms found for superposition in {model}. Skipping."
+                f"No matching atoms found for superposition in {model_path}. Skipping."
             )
-        else:
-            super_imposer = Superimposer()
-            super_imposer.set_atoms(ref_atoms, alt_atoms)
-            super_imposer.apply(alt_model.get_atoms())
+            return
+        super_imposer = Superimposer()
+        super_imposer.set_atoms(ref_atoms, alt_atoms)
+        super_imposer.apply(alt_model.get_atoms())
+        _write_mmcif_single_pass(alt_structure, mpath)
 
-            io = MMCIFIO()
-            io.set_structure(alt_structure)
-            io.save(str(model))  # overwrite the original file
+    targets = models_list[1:]
+    if len(targets) > 1:
+        with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
+            list(pool.map(_superpose_one, targets))
+    else:
+        _superpose_one(targets[0])

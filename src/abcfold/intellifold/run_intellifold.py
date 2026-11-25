@@ -1,10 +1,14 @@
+import json
 import logging
+import queue
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional, Union
+from typing import Iterable, Optional, Tuple, Union
 
-from abcfold.gpus import cuda_env
+from abcfold.backend_envs import jax_cache_dir, jax_runtime_env
+from abcfold.gpus import cuda_env, detect_gpu_slots
 from abcfold.intellifold.af3_to_intellifold import Intellifoldjson
 from abcfold.intellifold.check_install import ensure_intellifold_env
 from abcfold.output.cofolding_common import input_dir_for
@@ -73,6 +77,8 @@ def run_intellifold(
 
         intellifold_out_dir = output_dir / "intellifold_results"
         logger.info("Running IntelliFold using seeds: %s", intellifold_json.seeds)
+        cache_dir = jax_cache_dir(config)
+        cache_dir.mkdir(parents=True, exist_ok=True)
         cmd = (
             generate_intellifold_command(
                 out_file,
@@ -80,31 +86,125 @@ def run_intellifold(
                 model_dir,
                 number_of_models,
                 num_recycles=num_recycles,
+                jax_compilation_cache_dir=cache_dir,
             )
             if not test
             else generate_intellifold_test_command()
         )
 
-        try:
-            env.run(cmd, extra_env=cuda_env(gpus))
-        except subprocess.CalledProcessError as e:
-            stderr = e.stderr or ""
-            if stderr:
-                # The working directory is temporary unless --save_input is
-                # set, so the log goes next to the results where it survives.
-                output_dir.mkdir(parents=True, exist_ok=True)
-                output_err_file = output_dir / "intellifold_error.log"
-                output_err_file.write_text(stderr)
-                logger.error(
-                    "IntelliFold run failed. Error log is in %s", output_err_file
+        seeds = [int(s) for s in intellifold_json.seeds] or [42]
+        gpu_slots = detect_gpu_slots(gpus)
+        shard_seeds = (
+            not test
+            and len(seeds) > 1
+            and len(gpu_slots) > 1
+            and gpu_slots != ["cpu"]
+            and gpu_slots != ["all"]
+        )
+        if not shard_seeds:
+            extra_env = {**jax_runtime_env(config), **cuda_env(gpus)}
+            try:
+                env.run(cmd, extra_env=extra_env)
+            except subprocess.CalledProcessError as e:
+                stderr = e.stderr or ""
+                if stderr:
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    output_err_file = output_dir / "intellifold_error.log"
+                    output_err_file.write_text(stderr)
+                    logger.error(
+                        "IntelliFold run failed. Error log is in %s", output_err_file
+                    )
+                else:
+                    logger.error("IntelliFold run failed")
+                return False
+        else:
+            n_shards = min(len(gpu_slots), len(seeds))
+            shards: list[list[int]] = [[] for _ in range(n_shards)]
+            for idx, s in enumerate(seeds):
+                shards[idx % n_shards].append(s)
+
+            def _run_seed_shard(shard_idx: int) -> bool:
+                shard_dict = dict(intellifold_json.intellifold_dict)
+                shard_dict["modelSeeds"] = shards[shard_idx]
+                shard_json = working_dir / f"{input_json.stem}_shard{shard_idx}.json"
+                shard_json.write_text(json.dumps(shard_dict, indent=2))
+                s_cmd = generate_intellifold_command(
+                    shard_json,
+                    intellifold_out_dir,
+                    model_dir,
+                    number_of_models,
+                    num_recycles=num_recycles,
+                    jax_compilation_cache_dir=cache_dir,
                 )
-            else:
-                logger.error("IntelliFold run failed")
-            return False
+                s_env = {**jax_runtime_env(config), **cuda_env(gpu_slots[shard_idx])}
+                try:
+                    env.run(s_cmd, extra_env=s_env)
+                except subprocess.CalledProcessError as e:
+                    if e.stderr:
+                        output_dir.mkdir(parents=True, exist_ok=True)
+                        (output_dir / "intellifold_error.log").write_text(e.stderr)
+                    logger.error("IntelliFold shard %d failed", shard_idx)
+                    return False
+                return True
+
+            with ThreadPoolExecutor(max_workers=n_shards) as pool:
+                futs = [pool.submit(_run_seed_shard, i) for i in range(n_shards)]
+                if not all(f.result() for f in as_completed(futs)):
+                    return False
 
     logger.info("IntelliFold run complete")
     logger.info("Output files are in %s", output_dir)
     return True
+
+
+def run_intellifold_batch(
+    items: Iterable[Tuple[Union[str, Path], Union[str, Path]]],
+    config: dict,
+    save_input: bool = False,
+    test: bool = False,
+    number_of_models: int = 5,
+    num_recycles: int = 10,
+    gpus: Optional[str] = "all",
+) -> dict[Path, bool]:
+    """Run many IntelliFold jobs across all visible GPUs sharing a warm XLA cache."""
+    item_list = [(Path(inp), Path(out)) for inp, out in items]
+    if not item_list:
+        return {}
+    if test:
+        return {out: True for _, out in item_list}
+
+    gpu_slots = detect_gpu_slots(gpus)
+    slot_q: "queue.Queue[str]" = queue.Queue()
+    for s in gpu_slots:
+        slot_q.put(s)
+    results: dict[Path, bool] = {out: False for _, out in item_list}
+
+    def _run_one(inp: Path, job_out: Path) -> None:
+        slot = slot_q.get()
+        try:
+            results[job_out] = run_intellifold(
+                input_json=inp,
+                output_dir=job_out,
+                config=config,
+                save_input=save_input,
+                test=False,
+                number_of_models=number_of_models,
+                num_recycles=num_recycles,
+                gpus=slot,
+            )
+        finally:
+            slot_q.put(slot)
+
+    n_workers = min(len(gpu_slots), len(item_list))
+    if n_workers > 1:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futs = [pool.submit(_run_one, inp, out) for inp, out in item_list]
+            for fut in as_completed(futs):
+                fut.result()
+    else:
+        for inp, out in item_list:
+            _run_one(inp, out)
+    return results
 
 
 def generate_intellifold_command(
@@ -113,6 +213,7 @@ def generate_intellifold_command(
     model_dir: Union[str, Path],
     number_of_models: int = 5,
     num_recycles: int = 10,
+    jax_compilation_cache_dir: Optional[Union[str, Path]] = None,
 ) -> list:
     """
     Generate the IntelliFold command
@@ -147,6 +248,11 @@ def generate_intellifold_command(
         "--force_output_dir",
         "--norun_data_pipeline",
         "--resolve_msa_overlaps=false",
+        *(
+            [f"--jax_compilation_cache_dir={jax_compilation_cache_dir}"]
+            if jax_compilation_cache_dir
+            else []
+        ),
     ]
 
 

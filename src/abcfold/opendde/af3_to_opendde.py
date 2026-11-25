@@ -1,7 +1,6 @@
+import hashlib
 import json
 import logging
-import random
-import string
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
@@ -42,8 +41,10 @@ class OpenDDEjson:
         Returns:
             None
         """
-
-        with open(file_path, "w") as f:
+        out_path = Path(file_path)
+        if out_path.exists() and out_path.stat().st_size > 0:
+            return
+        with open(out_path, "w") as f:
             f.write(msa)
 
     def json_to_json(
@@ -137,8 +138,8 @@ class OpenDDEjson:
         if entity_type in ("protein", "rna"):
             unpaired_msa = seq_dict.get("unpairedMsa")
             if unpaired_msa and self.__create_files:
-                random_string = "".join(random.choices(string.ascii_letters, k=5))
-                msa_dir = Path(self.working_dir) / random_string
+                digest = hashlib.sha256(unpaired_msa.encode()).hexdigest()[:16]
+                msa_dir = Path(self.working_dir) / f"msa_{digest}"
                 msa_dir.mkdir(parents=True, exist_ok=True)
                 msa_out = msa_dir / "unpaired.a3m"
                 self.msa_to_file(unpaired_msa, msa_out)
@@ -147,8 +148,8 @@ class OpenDDEjson:
 
             paired_msa = seq_dict.get("pairedMsa")
             if paired_msa and self.__create_files and entity_type == "protein":
-                random_string = "".join(random.choices(string.ascii_letters, k=5))
-                msa_dir = Path(self.working_dir) / random_string
+                digest = hashlib.sha256(paired_msa.encode()).hexdigest()[:16]
+                msa_dir = Path(self.working_dir) / f"msa_{digest}"
                 msa_dir.mkdir(parents=True, exist_ok=True)
                 msa_out = msa_dir / "paired.a3m"
                 self.msa_to_file(paired_msa, msa_out)

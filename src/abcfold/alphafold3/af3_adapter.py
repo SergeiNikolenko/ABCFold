@@ -15,14 +15,17 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import string
 import subprocess
+import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from abcfold.gpus import docker_gpu_flags, to_physical
+from abcfold.gpus import detect_gpu_slots, docker_gpu_flags, to_physical
 
 logger = logging.getLogger("logger")
 
@@ -34,6 +37,7 @@ CONTAINER_OUTPUT_DIR = "/root/af_output"
 CONTAINER_MODEL_DIR = "/root/models"
 CONTAINER_DB_DIR = "/root/public_databases"
 CONTAINER_APP_DIR = "/app/alphafold"
+CONTAINER_JAX_CACHE_DIR = "/root/jax_cache"
 
 
 def sanitised_name(name: str) -> str:
@@ -57,6 +61,7 @@ class Af3Config:
     num_recycles: Optional[int] = None
     num_seeds: Optional[int] = None
     save_distogram: bool = False
+    jax_compilation_cache_dir: Optional[str] = None
     extra_flags: List[str] = field(default_factory=list)
 
     @classmethod
@@ -74,6 +79,7 @@ class Af3Config:
             append_flags=str(pick("af3_append_flags", True)).lower()
             not in ("false", "0", "no"),
             run_script=str(pick("af3_run_script", "run_alphafold.py")),
+            jax_compilation_cache_dir=pick("jax_cache_dir"),
         )
         for key, value in overrides.items():
             if value is not None:
@@ -89,15 +95,19 @@ def af3_flags(
     cfg: Af3Config,
     mode: str,
     json_path: Optional[str] = None,
+    input_dir: Optional[str] = None,
     output_dir: Optional[str] = None,
     model_dir: Optional[str] = None,
     db_dir: Optional[str] = None,
+    jax_cache_dir: Optional[str] = None,
 ) -> List[str]:
     """Flags for ``run_alphafold.py``; path flags only when paths are given."""
     if mode not in MODES:
         raise ValueError(f"Unknown AF3 mode {mode!r}, expected one of {MODES}")
     flags: List[str] = []
-    if json_path:
+    if input_dir:
+        flags.append(f"--input_dir={input_dir}")
+    elif json_path:
         flags.append(f"--json_path={json_path}")
     if model_dir and mode != "data_pipeline":
         flags.append(f"--model_dir={model_dir}")
@@ -117,6 +127,8 @@ def af3_flags(
             flags.append(f"--num_seeds={int(cfg.num_seeds)}")
         if cfg.save_distogram:
             flags.append("--save_distogram=true")
+        if jax_cache_dir:
+            flags.append(f"--jax_compilation_cache_dir={jax_cache_dir}")
     flags.extend(cfg.extra_flags)
     return flags
 
@@ -130,6 +142,8 @@ def build_af3_command(
     """Build the argv for one AlphaFold 3 invocation (no shell)."""
     input_json = Path(input_json).resolve()
     output_dir = Path(output_dir).resolve()
+    is_dir_input = input_json.is_dir()
+    host_input_dir = input_json if is_dir_input else input_json.parent
     needs_models = mode != "data_pipeline"
     needs_dbs = mode != "inference"
 
@@ -165,7 +179,7 @@ def build_af3_command(
         )
 
     mounts = [
-        (str(input_json.parent), CONTAINER_INPUT_DIR, True),
+        (str(host_input_dir), CONTAINER_INPUT_DIR, True),
         (str(output_dir), CONTAINER_OUTPUT_DIR, False),
     ]
     if needs_models:
@@ -174,14 +188,22 @@ def build_af3_command(
     if needs_dbs:
         mounts.append((str(Path(str(cfg.db_dir)).expanduser().resolve()),
                        CONTAINER_DB_DIR, True))
+    jax_cache_container: Optional[str] = None
+    if needs_models and cfg.jax_compilation_cache_dir:
+        host_jax = Path(str(cfg.jax_compilation_cache_dir)).expanduser().resolve()
+        host_jax.mkdir(parents=True, exist_ok=True)
+        mounts.append((str(host_jax), CONTAINER_JAX_CACHE_DIR, False))
+        jax_cache_container = CONTAINER_JAX_CACHE_DIR
 
     flags = af3_flags(
         cfg,
         mode,
-        json_path=f"{CONTAINER_INPUT_DIR}/{input_json.name}",
+        json_path=None if is_dir_input else f"{CONTAINER_INPUT_DIR}/{input_json.name}",
+        input_dir=CONTAINER_INPUT_DIR if is_dir_input else None,
         output_dir=CONTAINER_OUTPUT_DIR,
         model_dir=CONTAINER_MODEL_DIR if needs_models else None,
         db_dir=CONTAINER_DB_DIR if needs_dbs else None,
+        jax_cache_dir=jax_cache_container,
     )
 
     if cfg.runner == "docker":
@@ -219,6 +241,29 @@ def af3_subprocess_env(cfg: Af3Config, environ: Optional[Mapping] = None) -> Dic
         env["CUDA_VISIBLE_DEVICES"] = physical
         env["APPTAINERENV_CUDA_VISIBLE_DEVICES"] = physical
         env["SINGULARITYENV_CUDA_VISIBLE_DEVICES"] = physical
+    env.setdefault("XLA_FLAGS", "--xla_gpu_enable_triton_gemm=false")
+    env.setdefault("XLA_CLIENT_MEM_FRACTION", "0.95")
+    env.setdefault("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "0")
+    env.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "2")
+    if cfg.jax_compilation_cache_dir:
+        host_jax = str(Path(str(cfg.jax_compilation_cache_dir)).expanduser())
+        env.setdefault("JAX_COMPILATION_CACHE_DIR", host_jax)
+    if cfg.runner in ("apptainer", "singularity"):
+        env.setdefault("APPTAINERENV_XLA_FLAGS", env["XLA_FLAGS"])
+        env.setdefault("SINGULARITYENV_XLA_FLAGS", env["XLA_FLAGS"])
+        env.setdefault(
+            "APPTAINERENV_XLA_CLIENT_MEM_FRACTION", env["XLA_CLIENT_MEM_FRACTION"]
+        )
+        env.setdefault(
+            "SINGULARITYENV_XLA_CLIENT_MEM_FRACTION", env["XLA_CLIENT_MEM_FRACTION"]
+        )
+        if cfg.jax_compilation_cache_dir:
+            env.setdefault(
+                "APPTAINERENV_JAX_COMPILATION_CACHE_DIR", CONTAINER_JAX_CACHE_DIR
+            )
+            env.setdefault(
+                "SINGULARITYENV_JAX_COMPILATION_CACHE_DIR", CONTAINER_JAX_CACHE_DIR
+            )
     return env
 
 
@@ -393,3 +438,78 @@ def run_af3(
     elif not result.ok:
         raise RuntimeError(f"AlphaFold 3 wrote no model in {result.job_dir}")
     return result
+
+
+def run_af3_batch(
+    items: Iterable[Tuple[dict, Path | str]],
+    cfg: Af3Config,
+    mode: str = "inference",
+) -> Dict[Path, Optional[Af3Result]]:
+    """Run many AlphaFold 3 jobs via --input_dir (weights + XLA loaded once per GPU)."""
+    item_list = [(params, Path(out)) for params, out in items]
+    if not item_list:
+        return {}
+
+    gpu_slots = detect_gpu_slots(cfg.gpus)
+    n_shards = min(len(gpu_slots), len(item_list))
+    shards: List[List[Tuple[dict, Path]]] = [[] for _ in range(n_shards)]
+    for idx, entry in enumerate(item_list):
+        shards[idx % n_shards].append(entry)
+
+    results: Dict[Path, Optional[Af3Result]] = {out: None for _, out in item_list}
+
+    def _run_shard(shard_idx: int) -> None:
+        shard_items = shards[shard_idx]
+        shard_cfg = copy.copy(cfg)
+        if len(gpu_slots) > 1:
+            shard_cfg.gpus = gpu_slots[shard_idx]
+        with tempfile.TemporaryDirectory(prefix=f"abcfold-af3-shard{shard_idx}-") as td:
+            root = Path(td)
+            in_dir = root / "af3_input"
+            out_dir = root / "af3_output"
+            in_dir.mkdir(parents=True, exist_ok=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            names: List[Tuple[str, Path]] = []
+            for idx, (params, job_out) in enumerate(shard_items):
+                name = str(params.get("name") or f"job_{idx}")
+                prepared = (
+                    prepare_inference_input(params) if mode == "inference" else params
+                )
+                safe = sanitised_name(name) or f"job_{idx}"
+                (in_dir / f"{safe}.json").write_text(json.dumps(prepared, indent=2))
+                names.append((name, job_out))
+            argv = build_af3_command(in_dir, out_dir, shard_cfg, mode)
+            log_file = root / "af3_batch.log"
+            with log_file.open("w") as log:
+                proc = subprocess.run(
+                    argv,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    env=af3_subprocess_env(shard_cfg),
+                    check=False,
+                )
+            if proc.returncode != 0:
+                tail = log_file.read_text()[-2000:]
+                logger.error("AlphaFold 3 batch shard %d failed:\n%s", shard_idx, tail)
+                return
+            for name, job_out in names:
+                parsed = parse_af3_output(out_dir, name)
+                if parsed is None or not parsed.ok:
+                    continue
+                job_out.mkdir(parents=True, exist_ok=True)
+                target = job_out / f"alphafold3_{name}"
+                if target.exists():
+                    shutil.rmtree(target)
+                shutil.move(str(parsed.job_dir), str(target))
+                results[job_out] = (
+                    parse_af3_output(job_out, f"alphafold3_{name}") or parsed
+                )
+
+    if n_shards > 1:
+        with ThreadPoolExecutor(max_workers=n_shards) as pool:
+            futs = [pool.submit(_run_shard, i) for i in range(n_shards)]
+            for fut in as_completed(futs):
+                fut.result()
+    else:
+        _run_shard(0)
+    return results

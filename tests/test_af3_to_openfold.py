@@ -273,3 +273,33 @@ def test_openfold_write_yaml(test_data):
         assert yaml_string[11] == "  mode: predict"
         assert yaml_string[12] == "  seeds: [1]"
         assert yaml_string[13] == "  use_templates: false"
+
+
+def test_openfold_inline_template_cif_direct():
+    with tempfile.TemporaryDirectory() as td:
+        mmcif = Path("tests/test_data/6BJ9.cif").read_text()
+        params = {
+            "name": "of_tmpl",
+            "modelSeeds": [1, 2],
+            "sequences": [
+                {
+                    "protein": {
+                        "id": ["A"],
+                        "sequence": "GMRES",
+                        "templates": [{"mmcif": mmcif}],
+                    }
+                }
+            ],
+        }
+        of = OpenfoldJson(td)
+        data = of.json_to_json(params)
+        chain = data["queries"]["of_tmpl"]["chains"][0]
+        assert "template_cif_paths" in chain
+        assert len(chain["template_cif_paths"]) == 1
+        assert Path(chain["template_cif_paths"][0]).exists()
+
+        runner_yml = Path(td) / "runner.yml"
+        yaml_lines = of.write_yaml(runner_yml).splitlines()
+        assert "  seeds: [1, 2]" in yaml_lines
+        assert "  use_templates: true" in yaml_lines
+        assert "  fetch_missing_structures: false" in yaml_lines

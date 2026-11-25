@@ -1,12 +1,16 @@
 import logging
+from concurrent.futures import ThreadPoolExecutor
+import re
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 from abcfold.output.file_handlers import (CifFile, ConfidenceJsonFile,
                                           FileTypes, NpzFile)
 from abcfold.output.utils import af3_pae_path, Af3Pae
 
 logger = logging.getLogger("logger")
+
+SEED_DIR_PATTERN = re.compile(r"^seed_(\d+)$")
 
 
 class OpenfoldOutput:
@@ -80,7 +84,7 @@ class OpenfoldOutput:
 
         new_output_dirs = []
         for output_dir in self.output_dirs:
-            if output_dir.name.startswith("openfold_results_"):
+            if output_dir.name.startswith("openfold_results"):
                 new_path = new_parent / output_dir.name
                 output_dir.rename(new_path)
                 new_output_dirs.append(new_path)
@@ -109,6 +113,15 @@ class OpenfoldOutput:
             for seed in self.seeds
         }
 
+    @staticmethod
+    def _seed_from_path(path: Path) -> Optional[str]:
+        """Recover OpenFold 3 seed_<N> dir and normalise to seed-<N>."""
+        for part in path.parts:
+            match = SEED_DIR_PATTERN.match(part)
+            if match:
+                return f"seed-{match.group(1)}"
+        return None
+
     def process_openfold_output(self):
         """
         Function to process the output of a OpenFold 3 run
@@ -116,9 +129,7 @@ class OpenfoldOutput:
 
         file_groups: dict[str, dict[int, list]] = {}
         for pathway in self.output_dirs:
-            seed = pathway.name.split("_")[-1]
-            if seed not in file_groups:
-                file_groups[seed] = {}
+            fallback_seed = pathway.name.split("_")[-1]
 
             for output in pathway.rglob("*"):
                 number = None
@@ -127,6 +138,10 @@ class OpenfoldOutput:
                     continue
                 # OpenFold numbering starts at 1, -1 for consistency.
                 number = int(number_str) - 1
+
+                seed = self._seed_from_path(output) or fallback_seed
+                if seed not in file_groups:
+                    file_groups[seed] = {}
 
                 file_type = output.suffix[1:]
 
@@ -185,21 +200,28 @@ class OpenfoldOutput:
         Returns:
             None
         """
+        def _convert(item):
+            seed, pae_file, cif_file = item
+            pae = Af3Pae.from_openfold3(pae_file.data, cif_file)
+            out_name = af3_pae_path(cif_file)
+            pae.to_file(out_name)
+            return seed, ConfidenceJsonFile(out_name, data=pae.scores)
+
+        tasks = [
+            (seed, pae_file, cif_file)
+            for seed in self.seeds
+            for pae_file, cif_file in zip(
+                self.pae_files[seed], self.cif_files[seed]
+            )
+        ]
         new_pae_files: dict[str, list[ConfidenceJsonFile]] = {}
-        for seed in self.seeds:
-            for (pae_file, cif_file) in zip(self.pae_files[seed], self.cif_files[seed]):
-                pae = Af3Pae.from_openfold3(
-                    pae_file.data,
-                    cif_file,
-                )
-
-                out_name = af3_pae_path(cif_file)
-
-                pae.to_file(out_name)
-
-                if seed not in new_pae_files:
-                    new_pae_files[seed] = []
-                new_pae_files[seed].append(ConfidenceJsonFile(out_name))
+        if len(tasks) > 1:
+            with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as pool:
+                results = list(pool.map(_convert, tasks))
+        else:
+            results = [_convert(t) for t in tasks]
+        for seed, cjf in results:
+            new_pae_files.setdefault(seed, []).append(cjf)
 
         self.output = {
             seed: {

@@ -1,20 +1,22 @@
 import hashlib
 import json
 import logging
-import textwrap
+import os
+import shutil
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from typing import Dict, List, Optional, Union
 
-import numpy as _  # noqa F401
+import numpy as _np  # noqa: F401
 import pandas as pd
-import pyarrow as _  # noqa F401
+import pyarrow as _pa  # noqa: F401
 import requests
 
 from abcfold.output.atoms import VANDERWALLS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+_CCD_SMILES_CACHE: Dict[str, Optional[str]] = {}
 
 
 ATOMS_NAMES = sorted(list(VANDERWALLS.keys()), key=len, reverse=True)
@@ -142,12 +144,46 @@ check back for updates"
         Paired rows carry their row index as pairing key so Chai pairs them
         across chains; the conversion runs in-process (no backend env needed).
         """
+        target = Path(file_path).absolute()
+        if target.exists() and target.stat().st_size > 0:
+            return
+
+        cache_env = os.environ.get("ABCFOLD_CHAI_MSA_CACHE_DIR")
+        cache_path: Optional[Path] = None
+        if cache_env not in ("0", "off", "false"):
+            cache_root = (
+                Path(cache_env).expanduser()
+                if cache_env
+                else Path.home() / ".cache" / "abcfold" / "chai_msa"
+            )
+            digest = hashlib.sha256(
+                f"{msa or ''}\0{paired_msa or ''}".encode()
+            ).hexdigest()[:24]
+            cache_path = cache_root / f"{digest}.aligned.pqt"
+            if cache_path.is_file() and cache_path.stat().st_size > 0:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(cache_path, target)
+                except OSError:
+                    shutil.copyfile(cache_path, target)
+                logger.debug("Reused cached Chai MSA parquet %s", cache_path)
+                return
+
         from abcfold.msa.formats import chai_msa_frame
 
         df = chai_msa_frame(msa, paired_msa)
         if not df.empty:
-            df.to_parquet(Path(file_path).absolute())
-            logger.debug("Wrote Chai MSA parquet to %s", file_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(target)
+            logger.debug("Wrote Chai MSA parquet to %s", target)
+            if cache_path is not None:
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = cache_path.with_suffix(f".tmp.{os.getpid()}")
+                    shutil.copyfile(target, tmp)
+                    os.replace(tmp, cache_path)
+                except OSError:
+                    pass
 
     def json_to_fasta(self, json_file_or_dict: Union[dict, str, Path]):
         """
@@ -279,6 +315,11 @@ check back for updates"
     def ccd_to_smiles(self, ccd_id: str):
 
         assert isinstance(ccd_id, str), "CCD ID must be a string"
+        if not self.__create_files:
+            # Post-processing callers only need chain_ids, never remote SMILES.
+            return _CCD_SMILES_CACHE.get(ccd_id)
+        if ccd_id in _CCD_SMILES_CACHE:
+            return _CCD_SMILES_CACHE[ccd_id]
         logger.info(f"CCD code found in input: {ccd_id}")
         logger.info("Chai-1 currently only supports SMILES strings for ligands")
         logger.info("Attempting to retrieve SMILES from CCD")
@@ -292,6 +333,7 @@ check back for updates"
                 ccd_data = descriptor.get("SMILES") or descriptor.get("SMILES_stereo")
                 if ccd_data:
                     logger.info(f"SMILES retrieved from RCSB: {ccd_data}")
+                    _CCD_SMILES_CACHE[ccd_id] = ccd_data
                     return ccd_data
         except requests.RequestException as exc:
             logger.warning("RCSB lookup failed for %s: %s", ccd_id, exc)
@@ -305,6 +347,7 @@ check back for updates"
         if response.status_code == 200:
             ccd_data = response.text
             logger.info(f"SMILES retrieved from Cactus: {ccd_data}")
+            _CCD_SMILES_CACHE[ccd_id] = ccd_data
             return ccd_data
 
         logger.warning(f"Could not retrieve SMILES for {ccd_id}")
@@ -333,7 +376,9 @@ check back for updates"
             else:
                 for lig in lig_ids:
                     ligand_str += (
-                        f">protein|{lig}\n{''.join([f'({ccd})' for ccd in ccd_codes])}\n"
+                        f">protein|{lig}\n"
+                        + ''.join([f'({ccd})' for ccd in ccd_codes])
+                        + "\n"
                     )
                     fasta_data[lig] = "CCD-CODE_PLACEHOLDER"
         if "smiles" in seq["ligand"]:

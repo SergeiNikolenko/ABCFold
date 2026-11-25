@@ -25,7 +25,10 @@ def test_af3_to_boltz(test_data):
         assert yaml_string_multi[9] == f"{DELIM}{DELIM}id: [D, E]"
         assert (
             yaml_string_multi[10]
-            == f'{DELIM}{DELIM}smiles: "c1nc(c2c(n1)n(cn2)C3C(C(C(O3)COP(=O)(O)OP(=O)(O)OP(=O)(O)O)O)O)N"'
+            == (
+                f'{DELIM}{DELIM}smiles: "c1nc(c2c(n1)n(cn2)C3C(C(C(O3)'
+                'COP(=O)(O)OP(=O)(O)OP(=O)(O)O)O)O)N"'
+            )
         )
         assert yaml_string_multi[11] == f"{DELIM}- ligand:"
         assert yaml_string_multi[12] == f"{DELIM}{DELIM}id: F"
@@ -68,7 +71,10 @@ ELAMIGRLFAQDAELYADIIMDKSENLAVIETLKQTYDEALTFFENNDRQGFIDAFHKVRDWFGDYSEQFLKESRQLLQQ
         assert yaml_string_multi[9] == f"{DELIM}{DELIM}id: [D, E]"
         assert (
             yaml_string_multi[10]
-            == f'{DELIM}{DELIM}smiles: "c1nc(c2c(n1)n(cn2)C3C(C(C(O3)COP(=O)(O)OP(=O)(O)OP(=O)(O)O)O)O)N"'
+            == (
+                f'{DELIM}{DELIM}smiles: "c1nc(c2c(n1)n(cn2)C3C(C(C(O3)'
+                'COP(=O)(O)OP(=O)(O)OP(=O)(O)O)O)O)N"'
+            )
         )
         assert yaml_string_multi[11] == f"{DELIM}- ligand:"
         assert yaml_string_multi[12] == f"{DELIM}{DELIM}id: F"
@@ -177,7 +183,10 @@ def test_extra_ligand_ids():
         assert yaml_string[17] == f"{DELIM}{DELIM}id: [F]"
         assert (
             yaml_string[18]
-            == f'{DELIM}{DELIM}smiles: "c1nc(c2c(n1)n(cn2)C3C(C(C(O3)COP(=O)(O)OP(=O)(O)OP(=O)(O)O)O)O)N"'
+            == (
+                f'{DELIM}{DELIM}smiles: "c1nc(c2c(n1)n(cn2)C3C(C(C(O3)'
+                'COP(=O)(O)OP(=O)(O)OP(=O)(O)O)O)O)N"'
+            )
         )
         assert yaml_string[19] == f"{DELIM}- ligand:"
         assert yaml_string[20] == f"{DELIM}{DELIM}id: I"
@@ -210,3 +219,52 @@ def test_extra_ligand_ids():
         assert yaml_string[47] == f"{DELIM}- bond:"
         assert yaml_string[48] == f"{DELIM}{DELIM}atom1: ['E', 1, 'C1']"
         assert yaml_string[49] == f"{DELIM}{DELIM}atom2: ['G', 1, 'C1']"
+
+
+def test_af3_to_boltz_inline_templates_soft_and_forced():
+    import gemmi
+
+    from abcfold.scripts.abc_script_utils import get_mmcif
+
+    with tempfile.TemporaryDirectory() as td:
+        cif = "tests/test_data/6BJ9.cif"
+        chain = gemmi.read_structure(cif)[0][0].name
+        mmcif = get_mmcif(cif, "6BJ9", chain, 1, 200, tmpdir=td)
+        params = {
+            "name": "tmpl_test",
+            "modelSeeds": [1],
+            "sequences": [
+                {
+                    "protein": {
+                        "id": ["A"],
+                        "sequence": "GMRES",
+                        "templates": [{"mmcif": mmcif}],
+                    }
+                }
+            ],
+        }
+        # Soft template (default: no force/threshold)
+        soft = BoltzYaml(td)
+        soft_yaml = soft.json_to_yaml(params)
+        assert "templates:" in soft_yaml
+        assert "force: true" not in soft_yaml
+        assert "chain_id:" not in soft_yaml
+
+        # Normalised CIF has entities so Boltz gemmi parser succeeds
+        cif_line = next(ln for ln in soft_yaml.splitlines() if "- cif:" in ln)
+        cif_path = Path(cif_line.split("- cif:", 1)[1].strip())
+        assert cif_path.exists()
+        st = gemmi.read_structure(str(cif_path))
+        assert len(st.entities) > 0
+
+        # Forced template when threshold is supplied
+        forced = BoltzYaml(td, template_threshold=2.5)
+        forced_yaml = forced.json_to_yaml(params)
+        assert "force: true" in forced_yaml
+        assert "threshold: 2.5" in forced_yaml
+
+        # Merging top-level crystal templates and inline templates emits ONE header
+        params["templates"] = [{"cif": "/tmp/crystal.cif", "force": True}]
+        merged_yaml = BoltzYaml(td).json_to_yaml(params)
+        assert merged_yaml.count("templates:") == 1
+        assert "/tmp/crystal.cif" in merged_yaml

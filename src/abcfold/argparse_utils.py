@@ -45,6 +45,24 @@ def main_argpase_util(parser):
         help="GPU device(s) to use, e.g. 'all', '0', '0,1', 'cpu'",
     )
     parser.add_argument(
+        "--workers_per_gpu",
+        "--workers-per-gpu",
+        dest="workers_per_gpu",
+        type=int,
+        default=None,
+        help=dedent("[optional] Concurrent worker processes per GPU in batched "
+                    "and ligand-screening modes (default: auto from free VRAM)"),
+    )
+    parser.add_argument(
+        "--ligands",
+        nargs="+",
+        default=None,
+        help=dedent("[optional] Fast many-ligands screening against the input "
+                    "receptor: pass a .smi/.csv/.tsv/.json library file or "
+                    "inline SMILES / CCD:<code> entries. Shares 1 MSA fetch, "
+                    "1 ESM-2 embedding, and 1 checkpoint load per GPU worker."),
+    )
+    parser.add_argument(
         "--allow_version_mismatch",
         action="store_true",
         help=dedent("[optional] Run a backend even if its env has a different \
@@ -181,6 +199,38 @@ def prediction_argparse_util(parser):
         help=dedent("[optional] Diffusion sampling steps for Boltz, Chai-1, \
         Protenix and OpenFold3 (default: each backend's own default, 200)"),
     )
+    parser.add_argument(
+        "--max_msa_seqs",
+        type=int,
+        default=None,
+        help=dedent("[optional] Limit every protein MSA to this many sequences. \
+        If omitted, the MSA depth is not limited. Reducing depth can let \
+        templates have more influence."),
+    )
+    parser.add_argument(
+        "--ligand_smiles",
+        default=None,
+        help=dedent("[optional] Ligand SMILES for Boltz-2 affinity scoring of \
+        the predicted complexes. Enables affinity scoring."),
+    )
+    parser.add_argument(
+        "--ligand_ccd",
+        default=None,
+        help=dedent("[optional] Ligand CCD code for Boltz-2 affinity scoring \
+        (alternative to --ligand_smiles)."),
+    )
+    parser.add_argument(
+        "--ligand_chain",
+        default=None,
+        help=dedent("[optional] Restrict affinity scoring to the ligand in \
+        this chain (otherwise auto-detected)."),
+    )
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        help=dedent("[optional] Set up/check the selected predictor environments \
+        and checkpoints without running inference or creating output files."),
+    )
     return parser
 
 
@@ -248,8 +298,10 @@ def boltz_argparse_util(parser):
     parser.add_argument(
         "--boltz_template_threshold",
         type=float,
-        default=2.0,
-        help="[optional] Template force threshold in Angstroms (default: 2.0).",
+        default=None,
+        help=dedent("[optional] Enforce Boltz templates (force: true) within \
+        this distance threshold in Angstroms (default: soft templates; 2.0 in \
+        Boltz crystal modes)."),
     )
     parser.add_argument(
         "--boltz_pocket_radius",
@@ -292,6 +344,13 @@ def boltz_argparse_util(parser):
         default=None,
         help=dedent("[optional] Boltz maximum parallel diffusion samples. Leave unset \
         until an OOM boundary has been validated."),
+    )
+    parser.add_argument(
+        "--boltz_use_potentials",
+        action="store_true",
+        default=False,
+        help=dedent("[optional] Enable Boltz-2 physical steering potentials during \
+        diffusion sampling (slower, off by default)."),
     )
 
     return parser
@@ -485,6 +544,13 @@ def visuals_argparse_util(parser):
         help=dedent("[optional] Do not start a local server to view the results, the \
         output page is still generated and is accessible in the output directory"),
     )
+    parser.add_argument(
+        "--ccp4cloud",
+        action="store_true",
+        help=dedent("[optional] Produce an output page for services where a local \
+        server cannot run (e.g. CCP4 Cloud): skips PAE viewer generation, hides \
+        the model visualisations column, and does not start a local server."),
+    )
     return parser
 
 
@@ -585,8 +651,20 @@ def raise_argument_errors(args):
         logger.error("--boltz_mode 3 requires --boltz_ligand_chain")
         sys.exit(1)
 
-    if args.boltz_template_threshold <= 0:
+    if (
+        args.boltz_template_threshold is not None
+        and args.boltz_template_threshold <= 0
+    ):
         logger.error("--boltz_template_threshold must be greater than 0")
+        sys.exit(1)
+
+    max_msa = getattr(args, "max_msa_seqs", None)
+    if max_msa is not None and max_msa < 1:
+        logger.error("--max_msa_seqs must be greater than 0")
+        sys.exit(1)
+
+    if getattr(args, "ligand_smiles", None) and getattr(args, "ligand_ccd", None):
+        logger.error("Provide only one of --ligand_smiles or --ligand_ccd")
         sys.exit(1)
 
     if args.boltz_pocket_radius <= 0:

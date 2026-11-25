@@ -1,6 +1,8 @@
+import copy
 import json
 import logging
 import os
+import queue
 import shutil
 import socketserver
 import sys
@@ -8,9 +10,10 @@ import tempfile
 import time
 import traceback
 import webbrowser
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from abcfold.argparse_utils import (alphafold_argparse_util,
                                     boltz_argparse_util, chai_argparse_util,
@@ -36,7 +39,8 @@ from abcfold.output.protenix import ProtenixOutput
 from abcfold.output.rosettafold3 import RosettafoldOutput
 from abcfold.report import (EngineRecord, build_report, samples_from_output,
                             write_report)
-from abcfold.scripts.abc_script_utils import (check_input_json, make_dir,
+from abcfold.scripts.abc_script_utils import (check_input_json,
+                                              limit_json_msa_depth, make_dir,
                                               make_dummy_af3_db, setup_logger)
 from abcfold.settings import Settings, load_settings
 
@@ -181,11 +185,29 @@ def _write_json(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
+def _parse_gpu_slots(gpus: Optional[str]) -> List[Optional[str]]:
+    """Resolve --gpus into individual visible GPU slots (auto-discovering all GPUs)."""
+    from abcfold.gpus import detect_gpu_slots
+
+    if gpus is None:
+        detected = detect_gpu_slots("all")
+        return [None] if detected == ["all"] else list(detected)
+    detected = detect_gpu_slots(gpus)
+    return list(detected)
+
+
 def run(args, settings: Optional[Settings] = None) -> int:
     """Run ABCFold and return the exit code (0 ok, 2 partial, 1 failed)."""
     args.output_dir = Path(args.output_dir)
     settings = resolve_settings(args, settings)
     rt_config = settings.runtime_config()
+
+    if getattr(args, "dry_run", False):
+        from abcfold.dry_run import setup_environments
+
+        setup_environments(args, settings)
+        return EXIT_OK
+
     args = raise_argument_errors(args)
 
     if args.mmseqs2:
@@ -250,90 +272,352 @@ def run(args, settings: Optional[Settings] = None) -> int:
             )
             input_params = json.loads(run_json.read_text())
 
+        max_msa_seqs = getattr(args, "max_msa_seqs", None)
+        if max_msa_seqs:
+            input_params = limit_json_msa_depth(
+                run_json, run_json, max_msa_seqs
+            )
+            logger.info("Limiting MSA depth to %d sequence(s)", max_msa_seqs)
+
+        ligands_spec = getattr(args, "ligands", None)
+        if ligands_spec:
+            from abcfold.batch import (
+                BatchStatus,
+                _run_batch_phased,
+                expand_receptor_with_ligands,
+                load_ligand_library,
+                sort_jobs_for_throughput,
+            )
+
+            ligand_entries = load_ligand_library(ligands_spec)
+            jobs = sort_jobs_for_throughput(
+                expand_receptor_with_ligands(
+                    input_params,
+                    ligand_entries,
+                    models=engines,
+                    n_models=args.number_of_models,
+                ),
+                descending=True,
+            )
+            logger.info(
+                "Many-ligands screening mode: %d ligand(s) against %s using %s",
+                len(jobs),
+                name,
+                ", ".join(engines),
+            )
+            inputs_dir = args.output_dir / "inputs"
+            logs_dir = args.output_dir / "logs"
+            jobs_dir = args.output_dir / "jobs"
+            for d in (inputs_dir, logs_dir, jobs_dir):
+                d.mkdir(parents=True, exist_ok=True)
+            status = BatchStatus(args.output_dir / "batch_status.json", run_json)
+            parsed_args = {
+                "config_file": getattr(args, "config_file", None),
+                "msa_cache_dir": settings.get("msa_cache_dir"),
+                "msa_server_url": settings.get("msa_server_url"),
+                "num_recycles": args.num_recycles,
+                "diffusion_steps": args.diffusion_steps,
+                "number_of_models": args.number_of_models,
+                "max_msa_seqs": max_msa_seqs,
+                "min_msa_rows": settings.get("min_msa_rows"),
+                "boltz_preprocessing_threads": args.boltz_preprocessing_threads,
+                "boltz_num_workers": args.boltz_num_workers,
+                "boltz_max_parallel_samples": args.boltz_max_parallel_samples,
+                "protenix_model": getattr(args, "protenix_model", None),
+                "template_mirror_dir": args.template_mirror_dir,
+                "inference_ckpt_path": getattr(args, "inference_ckpt_path", None),
+                "save_input": args.save_input,
+                "boltz_use_potentials": bool(
+                    getattr(args, "boltz_use_potentials", False)
+                ),
+                "openfold_fetch_templates": bool(
+                    getattr(args, "openfold_fetch_templates", False)
+                ),
+                "allow_version_mismatch": bool(
+                    getattr(args, "allow_version_mismatch", False)
+                ),
+                "no_paired_msa": bool(getattr(args, "no_paired_msa", False)),
+            }
+            batch_res = _run_batch_phased(
+                todo=jobs,
+                output_dir=args.output_dir,
+                inputs_dir=inputs_dir,
+                logs_dir=logs_dir,
+                jobs_dir=jobs_dir,
+                status=status,
+                gpus=args.gpus,
+                msa="auto",
+                msa_options=None,
+                parsed_args=parsed_args,
+                run_args=(),
+                max_parallel=1,
+                workers_per_gpu=getattr(args, "workers_per_gpu", None),
+            )
+            counts = batch_res.get("counts", {})
+            ok_n = int(counts.get("ok", 0))
+            if ok_n == len(jobs):
+                return EXIT_OK
+            return EXIT_PARTIAL if ok_n > 0 else EXIT_FAILED
+
         # An MSA that was requested but came back (nearly) empty would let every
         # backend fold single-sequence without noticing.
         from abcfold.msa.guard import (ShallowMsaError, check_input_msa_depth,
                                        min_msa_rows)
 
+        effective_min_rows = min_msa_rows(rt_config)
+        if max_msa_seqs and effective_min_rows > max_msa_seqs:
+            effective_min_rows = max_msa_seqs
+            rt_config["min_msa_rows"] = effective_min_rows
+
         precheck_error = None
         try:
-            check_input_msa_depth(input_params, min_msa_rows(rt_config),
+            check_input_msa_depth(input_params, effective_min_rows,
                                   context=str(run_json.name))
         except ShallowMsaError as exc:
             logger.error(str(exc))
             precheck_error = str(exc)
 
-        runners: Dict[str, Callable[[], EngineOutcome]] = {
-            "alphafold3": lambda: _run_alphafold3(
-                args, rt_config, run_json, input_params, temp_dir, name
-            ),
-            "boltz": lambda: _run_boltz(args, rt_config, run_json, input_params,
-                                        name),
-            "chai1": lambda: _run_chai(args, rt_config, run_json, input_params,
-                                       temp_dir, name),
-            "protenix": lambda: _run_protenix(args, rt_config, run_json,
-                                              input_params, name),
-            "openfold3": lambda: _run_openfold(args, rt_config, run_json,
-                                               input_params, temp_dir, name),
-            "rosettafold3": lambda: _run_rosettafold(args, rt_config, run_json,
-                                                     input_params, name),
-            "intellifold": lambda: _run_intellifold(args, rt_config, run_json,
-                                                    input_params, name),
-            "opendde": lambda: _run_opendde(args, rt_config, run_json,
-                                            input_params, name),
-            "esmfold2": lambda: _run_esmfold2(args, rt_config, run_json,
-                                              input_params, name),
-        }
+        def _dispatch_engine(
+            engine: str,
+            engine_args: Any,
+            params_snapshot: dict,
+        ) -> EngineOutcome:
+            if engine == "alphafold3":
+                return _run_alphafold3(
+                    engine_args, rt_config, run_json, params_snapshot, temp_dir, name
+                )
+            if engine == "boltz":
+                return _run_boltz(
+                    engine_args, rt_config, run_json, params_snapshot, name
+                )
+            if engine == "chai1":
+                return _run_chai(
+                    engine_args, rt_config, run_json, params_snapshot, temp_dir, name
+                )
+            if engine == "protenix":
+                return _run_protenix(
+                    engine_args, rt_config, run_json, params_snapshot, name
+                )
+            if engine == "openfold3":
+                return _run_openfold(
+                    engine_args, rt_config, run_json, params_snapshot, temp_dir, name
+                )
+            if engine == "rosettafold3":
+                return _run_rosettafold(
+                    engine_args, rt_config, run_json, params_snapshot, name
+                )
+            if engine == "intellifold":
+                return _run_intellifold(
+                    engine_args, rt_config, run_json, params_snapshot, name
+                )
+            if engine == "opendde":
+                return _run_opendde(
+                    engine_args, rt_config, run_json, params_snapshot, name
+                )
+            if engine == "esmfold2":
+                return _run_esmfold2(
+                    engine_args, rt_config, run_json, params_snapshot, name
+                )
+            raise ValueError(f"Unknown engine: {engine}")
 
-        for engine in engines:
-            record = records[engine]
-            record.version = settings.backend(engine).get("version")
+        def _execute_engine(
+            engine: str,
+            engine_args: Any,
+            params_snapshot: dict,
+        ) -> Tuple[str, EngineOutcome, float, float]:
             logger.info("Running %s", DISPLAY_NAMES[engine])
             start = time.monotonic()
             wall_start = time.time() - 1
-            if precheck_error is not None:
-                record.status = "failed"
-                record.error = precheck_error
-                record.seconds = 0.0
-                continue
             try:
-                outcome = runners[engine]()
+                outcome = _dispatch_engine(engine, engine_args, params_snapshot)
             except SystemExit as exc:
                 outcome = EngineOutcome(False, error=f"exited with {exc.code}")
             except Exception as exc:  # one backend must not stop the others
                 logger.error("%s failed: %s", DISPLAY_NAMES[engine], exc)
                 logger.debug(traceback.format_exc())
                 outcome = EngineOutcome(False, error=f"{type(exc).__name__}: {exc}")
-            record.seconds = time.monotonic() - start
-            if outcome.ok:
-                record.status = "ok"
-                if outcome.output is not None:
-                    outputs.append((engine, outcome.output))
-                    try:
-                        n = sum(
-                            1 for models in outcome.output.output.values()
-                            for idx in models if not (isinstance(idx, int) and idx < 0)
-                        )
-                        record.samples = samples_from_output(
-                            engine, record.version, outcome.output.output,
-                            args.output_dir,
-                            seconds_per_sample=(record.seconds / n) if n else None,
-                        )
-                    except Exception as exc:
-                        logger.warning("Could not summarise %s samples: %s",
-                                       engine, exc)
-            else:
-                record.status = "failed"
-                record.error = (
-                    outcome.error
-                    or _error_from_logs(args.output_dir, wall_start)
-                    or "backend produced no structures"
+            return engine, outcome, time.monotonic() - start, wall_start
+
+        def _summarise_outcome(
+            engine: str,
+            record: EngineRecord,
+            outcome: EngineOutcome,
+        ) -> None:
+            if outcome.output is None:
+                return
+            try:
+                n = sum(
+                    1
+                    for models in outcome.output.output.values()
+                    for idx in models
+                    if not (isinstance(idx, int) and idx < 0)
                 )
-                logger.error("%s failed: %s", DISPLAY_NAMES[engine],
-                             record.error.splitlines()[0] if record.error else "")
-            if engine == "alphafold3" and outcome.ok:
-                # AF3 may have produced MSAs that the other backends can reuse
-                input_params = json.loads(run_json.read_text())
+                record.samples = samples_from_output(
+                    engine,
+                    record.version,
+                    outcome.output.output,
+                    args.output_dir,
+                    seconds_per_sample=(
+                        (record.seconds / n)
+                        if (n and record.seconds is not None)
+                        else None
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("Could not summarise %s samples: %s", engine, exc)
+
+        outcomes_by_engine: Dict[str, EngineOutcome] = {}
+        if precheck_error is not None:
+            for engine in engines:
+                record = records[engine]
+                record.version = settings.backend(engine).get("version")
+                record.status = "failed"
+                record.error = precheck_error
+                record.seconds = 0.0
+        else:
+            gpu_slots = _parse_gpu_slots(getattr(args, "gpus", "all"))
+            af3_first = [e for e in engines if e == "alphafold3"]
+            remaining_engines = [e for e in engines if e != "alphafold3"]
+            summary_futures: List[Future[None]] = []
+
+            def _record_result(
+                engine: str,
+                outcome: EngineOutcome,
+                elapsed: float,
+                wall_start: float,
+                summary_pool: ThreadPoolExecutor,
+            ) -> None:
+                record = records[engine]
+                record.version = settings.backend(engine).get("version")
+                record.seconds = elapsed
+                outcomes_by_engine[engine] = outcome
+                if outcome.ok:
+                    record.status = "ok"
+                    if outcome.output is not None:
+                        summary_futures.append(
+                            summary_pool.submit(
+                                _summarise_outcome, engine, record, outcome
+                            )
+                        )
+                else:
+                    record.status = "failed"
+                    record.error = (
+                        outcome.error
+                        or _error_from_logs(args.output_dir, wall_start)
+                        or "backend produced no structures"
+                    )
+                    logger.error(
+                        "%s failed: %s",
+                        DISPLAY_NAMES[engine],
+                        record.error.splitlines()[0] if record.error else "",
+                    )
+
+            with ThreadPoolExecutor(
+                max_workers=min(4, max(1, len(engines)))
+            ) as summary_pool:
+                for engine in af3_first:
+                    eng, outcome, elapsed, wall_start = _execute_engine(
+                        engine, args, input_params
+                    )
+                    _record_result(eng, outcome, elapsed, wall_start, summary_pool)
+                    if outcome.ok:
+                        if max_msa_seqs:
+                            input_params = limit_json_msa_depth(
+                                run_json, run_json, max_msa_seqs
+                            )
+                        else:
+                            input_params = json.loads(run_json.read_text())
+
+                if len(gpu_slots) > 1 and len(remaining_engines) > 1:
+                    logger.info(
+                        "Dispatching %d engines in parallel across %d GPUs (%s)",
+                        len(remaining_engines),
+                        len(gpu_slots),
+                        ",".join(str(g) for g in gpu_slots),
+                    )
+                    slot_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+                    for slot in gpu_slots:
+                        slot_queue.put(slot)
+
+                    def _run_on_slot(
+                        engine: str,
+                    ) -> Tuple[str, EngineOutcome, float, float]:
+                        slot = slot_queue.get()
+                        try:
+                            engine_args = copy.copy(args)
+                            engine_args.gpus = slot
+                            return _execute_engine(engine, engine_args, input_params)
+                        finally:
+                            slot_queue.put(slot)
+
+                    with ThreadPoolExecutor(
+                        max_workers=min(len(gpu_slots), len(remaining_engines))
+                    ) as gpu_pool:
+                        futs = [
+                            gpu_pool.submit(_run_on_slot, eng)
+                            for eng in remaining_engines
+                        ]
+                        for fut in as_completed(futs):
+                            eng, outcome, elapsed, wall_start = fut.result()
+                            _record_result(
+                                eng, outcome, elapsed, wall_start, summary_pool
+                            )
+                else:
+                    for engine in remaining_engines:
+                        eng, outcome, elapsed, wall_start = _execute_engine(
+                            engine, args, input_params
+                        )
+                        _record_result(eng, outcome, elapsed, wall_start, summary_pool)
+
+                for sfut in summary_futures:
+                    sfut.result()
+
+            for engine in engines:
+                outcome_opt = outcomes_by_engine.get(engine)
+                if (
+                    outcome_opt is not None
+                    and outcome_opt.ok
+                    and outcome_opt.output is not None
+                ):
+                    outputs.append((engine, outcome_opt.output))
+
+        affinity_scores: Dict[str, Dict[str, Any]] = {}
+        if outputs and (
+            getattr(args, "ligand_smiles", None)
+            or getattr(args, "ligand_ccd", None)
+        ):
+            from abcfold.affinity.run_affinity import (extract_affinity_msa,
+                                                       run_boltz_affinity)
+            from abcfold.html.html_utils import get_all_cif_files
+
+            all_cifs = [
+                cif.pathway
+                for cif_list in get_all_cif_files(
+                    [out for _, out in outputs]
+                ).values()
+                for cif in cif_list
+            ]
+            affinity_msa = extract_affinity_msa(input_params, args.output_dir)
+            affinity_scores = run_boltz_affinity(
+                all_cifs,
+                args.output_dir,
+                smiles=args.ligand_smiles,
+                ccd=args.ligand_ccd,
+                ligand_chain=getattr(args, "ligand_chain", None),
+                msa=affinity_msa,
+                config=rt_config,
+                gpus=args.gpus,
+            )
+            if affinity_scores:
+                for rec in records.values():
+                    for sample in rec.samples:
+                        cand = str((args.output_dir / sample.cif).resolve())
+                        aff = affinity_scores.get(cand)
+                        if aff:
+                            sample.affinity_pred_value = aff.get("affinity_pred_value")
+                            sample.affinity_probability_binary = aff.get(
+                                "affinity_probability_binary"
+                            )
 
         report = build_report(
             name=name,
@@ -363,7 +647,13 @@ def run(args, settings: Optional[Settings] = None) -> int:
             logger.error("No models were generated")
             return exit_code
         try:
-            render_html(outputs, args.output_dir, no_server=args.no_server)
+            render_html(
+                outputs,
+                args.output_dir,
+                no_server=args.no_server,
+                affinity_scores=affinity_scores,
+                ccp4cloud=bool(getattr(args, "ccp4cloud", False)),
+            )
         except Exception as exc:
             logger.error("Could not build the HTML report: %s", exc)
             logger.debug(traceback.format_exc())
@@ -493,6 +783,7 @@ def _run_boltz(args, rt_config, run_json, input_params, name) -> EngineOutcome:
         num_workers=args.boltz_num_workers,
         max_parallel_samples=args.boltz_max_parallel_samples,
         sampling_steps=args.diffusion_steps or 200,
+        boltz_use_potentials=bool(getattr(args, "boltz_use_potentials", False)),
     )
     if not ok:
         return EngineOutcome(False)
@@ -519,6 +810,7 @@ def _run_chai(args, rt_config, run_json, input_params, temp_dir, name):
         device=args.gpus,
         config=rt_config,
         diffusion_steps=args.diffusion_steps or 200,
+        mmseqs_database=args.mmseqs_database,
     )
     if not ok:
         return EngineOutcome(False)
@@ -585,6 +877,7 @@ def _run_rosettafold(args, rt_config, run_json, input_params, name):
         output_dir=args.output_dir,
         save_input=args.save_input,
         number_of_models=args.number_of_models,
+        gpus=args.gpus,
         config=rt_config,
     )
     if not ok:
@@ -654,8 +947,13 @@ def _run_esmfold2(args, rt_config, run_json, input_params, name):
     )
 
 
-def render_html(outputs: List[Tuple[str, ModelOutput]], output_dir: Path,
-                no_server: bool = False) -> None:
+def render_html(
+    outputs: List[Tuple[str, ModelOutput]],
+    output_dir: Path,
+    no_server: bool = False,
+    affinity_scores: Optional[Dict[str, Dict[str, Any]]] = None,
+    ccp4cloud: bool = False,
+) -> None:
     """Build the interactive HTML page (and optionally serve it)."""
     from abcfold.html.html_utils import (PORT, NoCacheHTTPRequestHandler,
                                          get_all_cif_files, get_model_data,
@@ -666,7 +964,11 @@ def render_html(outputs: List[Tuple[str, ModelOutput]], output_dir: Path,
     from abcfold.output.utils import get_gap_indicies, insert_none_by_minus_one
 
     model_outputs = [out for _, out in outputs]
-    plot_dict = plots(model_outputs, output_dir.joinpath(PLOTS_DIR))
+    plot_dict = plots(
+        model_outputs,
+        output_dir.joinpath(PLOTS_DIR),
+        include_pae=not ccp4cloud,
+    )
     cif_models = [
         cif_file
         for cif_list in get_all_cif_files(model_outputs).values()
@@ -676,7 +978,7 @@ def render_html(outputs: List[Tuple[str, ModelOutput]], output_dir: Path,
     index_counter = 0
 
     programs_run: List[str] = []
-    combined_models: List[Dict[str, Any]] = []
+    model_jobs = []
     for engine, out in outputs:
         programs_run.append(DISPLAY_NAMES[engine])
         for seed in out.output.keys():
@@ -685,7 +987,6 @@ def render_html(outputs: List[Tuple[str, ModelOutput]], output_dir: Path,
                     continue
                 files = out.output[seed][idx]
                 model = files["cif"]
-                model.check_clashes()
                 score_file = next(
                     (files[k] for k in ("summary", "json", "scores", "score")
                      if files.get(k) is not None),
@@ -695,10 +996,27 @@ def render_html(outputs: List[Tuple[str, ModelOutput]], output_dir: Path,
                 if len(indicies) > 0:
                     plddt = insert_none_by_minus_one(indicies[index_counter], plddt)
                 index_counter += 1
-                combined_models.append(get_model_data(
-                    model, plot_dict, DISPLAY_NAMES[engine], plddt,
-                    files["af3_pae"], score_file, output_dir,
+                model_jobs.append((
+                    model, DISPLAY_NAMES[engine], plddt,
+                    files["af3_pae"], score_file,
                 ))
+
+    def _score_one(job):
+        model, method, plddt, pae_obj, score_file = job
+        model.check_clashes()
+        return get_model_data(
+            model, plot_dict, method, plddt,
+            pae_obj, score_file, output_dir,
+            affinity_scores=affinity_scores,
+        )
+
+    if len(model_jobs) > 1:
+        with ThreadPoolExecutor(max_workers=min(8, len(model_jobs))) as pool:
+            combined_models: List[Dict[str, Any]] = list(
+                pool.map(_score_one, model_jobs)
+            )
+    else:
+        combined_models = [_score_one(j) for j in model_jobs]
 
     prefix_by_display = {DISPLAY_NAMES[e]: MODEL_PREFIX[e] for e in DISPLAY_NAMES}
     models_dir = output_dir.joinpath("output_models")
@@ -727,6 +1045,7 @@ def render_html(outputs: List[Tuple[str, ModelOutput]], output_dir: Path,
         .relative_to(output_dir.resolve())
         .as_posix(),
         "chain_data": chain_data,
+        "ccp4cloud": bool(ccp4cloud),
     })
 
     if not output_dir.joinpath(".feature_viewer").exists():
@@ -748,6 +1067,13 @@ def render_html(outputs: List[Tuple[str, ModelOutput]], output_dir: Path,
         version=abcfold_version() or "2",
     )
     logger.info(f"Output page written to {html_out}")
+    if ccp4cloud:
+        logger.info(
+            "ccp4cloud mode: local server disabled and model "
+            "visualisations column omitted"
+        )
+        return
+
     output_open_html_script(str(output_dir / "open_output.py"), port=PORT)
 
     if no_server:
