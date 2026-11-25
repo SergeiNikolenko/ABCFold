@@ -331,27 +331,52 @@ def pull_image(spec: "BackendEnvSpec", dry_run: bool = False) -> List[List[str]]
     return cmds
 
 
-CONTAINER_BASE = "mambaorg/micromamba:2.3.2"
+CONTAINER_BASE = "mambaorg/micromamba:2.5.0"
+UV_IMAGE = "ghcr.io/astral-sh/uv:0.11.7"
+SLIM_RUNTIME = "debian:bookworm-slim"
+DISTROLESS_RUNTIME = "gcr.io/distroless/cc-debian12"
+_TRITON_BACKENDS = frozenset(
+    {"boltz", "chai1", "esmfold2", "opendde", "openfold3", "protenix"}
+)
 
 
-def _recipe_steps(spec: "BackendEnvSpec", strip: bool = True) -> List[str]:
+def _prune_env_cmd(prefix: str) -> str:
+    return (
+        f"find {prefix} -type f -name '*.a' -delete"
+        f" && find {prefix}/lib/python*/site-packages -maxdepth 3 -type d"
+        r" \( -name test -o -name tests \) -exec rm -rf {} +"
+        f" && rm -rf {prefix}/lib/python*/{{test,idlelib,tkinter,ensurepip}}"
+        f" {prefix}/lib/python*/site-packages/torch/{{test,include,share}}"
+        f" {prefix}/lib/python*/site-packages/triton/backends/amd"
+        f" {prefix}/share/{{doc,man,info}}"
+    )
+
+
+def _recipe_steps(
+    spec: "BackendEnvSpec",
+    strip: bool = True,
+    uv_bin: str = "/opt/abcfold/bin/uv",
+    use_cache_mount: bool = False,
+) -> List[str]:
     """Shell lines that install the pinned backend into /opt/abcfold."""
     remove = list(FORBIDDEN_PACKAGES) + (list(spec.strip) if strip else [])
     conda = ["python=" + spec.python, *spec.conda]
     steps = [
         "micromamba create -y -p /opt/abcfold -c conda-forge -c bioconda "
         + " ".join(conda),
-        "/opt/abcfold/bin/python -m pip install --no-cache-dir uv",
     ]
-    # --no-cache: a wheel cache inside the image would double the CUDA wheels
-    # (about 4 GB) in the layer that creates them.
-    install = ("/opt/abcfold/bin/uv pip install --no-cache "
-               "--python /opt/abcfold/bin/python")
+    if not use_cache_mount:
+        steps.append("/opt/abcfold/bin/python -m pip install --no-cache-dir uv")
+    cache_flag = "" if use_cache_mount else "--no-cache "
+    install = (
+        f"{uv_bin} pip install {cache_flag}--compile-bytecode "
+        "--python /opt/abcfold/bin/python"
+    )
     if spec.torch_backend:
         install += f" --torch-backend {spec.torch_backend}"
     if spec.overrides:
         steps.append(
-            "printf '%s\\n' " + " ".join(f"'{o}'" for o in spec.overrides)
+            "printf '%s\n' " + " ".join(f"'{o}'" for o in spec.overrides)
             + " > /tmp/overrides.txt"
         )
         install += " --override /tmp/overrides.txt"
@@ -360,19 +385,23 @@ def _recipe_steps(spec: "BackendEnvSpec", strip: bool = True) -> List[str]:
     # Tolerant: uninstalling a package that was never pulled in is not an
     # error, but the recipe runs under `set -e`.
     steps.append(
-        "/opt/abcfold/bin/uv pip uninstall --python /opt/abcfold/bin/python "
+        f"{uv_bin} pip uninstall --python /opt/abcfold/bin/python "
         + " ".join(remove) + " || true"
     )
-    steps.append("/opt/abcfold/bin/python -c \""
-                 + "; ".join(f"import {m}" for m in
-                             (spec.smoke or [spec.package.replace('-', '_')]))
-                 + "\"")
-    steps.append("micromamba clean -y --all")
+    steps.append("rm -f /tmp/overrides.txt")
+    steps.append(_prune_env_cmd("/opt/abcfold"))
+    mods = spec.smoke or [spec.package.replace("-", "_")]
+    steps.append(
+        '/opt/abcfold/bin/python -c "' + "; ".join(f"import {m}" for m in mods) + '"'
+    )
+    if not use_cache_mount:
+        steps.append("micromamba clean -y --all")
     return steps
 
 
-def container_recipe(spec: "BackendEnvSpec", kind: str = "apptainer",
-                     strip: bool = True) -> str:
+def container_recipe(
+    spec: "BackendEnvSpec", kind: str = "apptainer", strip: bool = True
+) -> str:
     """A Dockerfile or Apptainer definition for a backend, from the same pins.
 
     The image installs exactly what `abcfold envs build` installs, so a run in a
@@ -380,23 +409,68 @@ def container_recipe(spec: "BackendEnvSpec", kind: str = "apptainer",
     backend is on PATH, so ABCFold reaches it with
     ``[backends.<name>] image = "<image>"`` and ``env = "@current"``.
     """
-    steps = _recipe_steps(spec, strip=strip)
     if kind == "docker":
+        steps = _recipe_steps(
+            spec, strip=strip, uv_bin="/usr/local/bin/uv", use_cache_mount=True
+        )
+        joined = " \\n    && ".join(steps)
+        needs_triton = spec.name in _TRITON_BACKENDS
         lines = [
+            "# syntax=docker/dockerfile:1.7",
             f"# {spec.name}: {spec.package}=={spec.version}",
-            f"FROM {CONTAINER_BASE}",
+            f"FROM {UV_IMAGE} AS uv",
+            "",
+            f"FROM {CONTAINER_BASE} AS builder",
             "USER root",
-            "ENV MAMBA_ROOT_PREFIX=/opt/micromamba PATH=/opt/abcfold/bin:$PATH",
+            "COPY --from=uv /uv /usr/local/bin/uv",
+            (
+                "ENV MAMBA_ROOT_PREFIX=/opt/micromamba "
+                "UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1"
+            ),
+            "RUN --mount=type=cache,target=/opt/micromamba/pkgs \\",
+            "    --mount=type=cache,target=/root/.cache/uv \\",
+            f"    {joined}",
         ]
-        lines += [f"RUN {step}" for step in steps]
         if spec.name == "intellifold":
-            lines.append(
-                "# The vendored AlphaFold 3 engine is not on PyPI: add\n"
-                "# `COPY third_party/alphafold3 /tmp/af3` and\n"
-                "# `RUN /opt/abcfold/bin/python -m pip install /tmp/af3 && "
-                "build_data` from an IntelliFold checkout."
+            lines += [
+                "# The vendored AlphaFold 3 engine is not on PyPI: add",
+                "# `COPY third_party/alphafold3 /tmp/af3` and",
+                (
+                    "# `RUN /usr/local/bin/uv pip install --python "
+                    "/opt/abcfold/bin/python /tmp/af3 && "
+                    "/opt/abcfold/bin/build_data` from an IntelliFold checkout."
+                ),
+            ]
+        lines.append("")
+        if needs_triton:
+            keep_apt = (
+                '    && echo \'Binary::apt::APT::Keep-Downloaded-Packages "true";'
+                "\' > /etc/apt/apt.conf.d/keep-cache"
             )
+            lines += [
+                f"FROM {SLIM_RUNTIME}",
+                "RUN rm -f /etc/apt/apt.conf.d/docker-clean \\",
+                keep_apt,
+                "RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \\",
+                "    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \\",
+                "    apt-get update && apt-get install -y --no-install-recommends "
+                "gcc libc6-dev",
+            ]
+        else:
+            lines += [
+                f"FROM {DISTROLESS_RUNTIME}",
+                "COPY --from=builder /usr/bin/env /usr/bin/env",
+            ]
+        lines += [
+            "COPY --from=builder /opt/abcfold /opt/abcfold",
+            "ENV PATH=/opt/abcfold/bin:/usr/local/bin:/usr/bin:/bin \\",
+            "    PYTHONUNBUFFERED=1 \\",
+            "    PYTHONDONTWRITEBYTECODE=1 \\",
+            "    NVIDIA_VISIBLE_DEVICES=all \\",
+            "    NVIDIA_DRIVER_CAPABILITIES=compute,utility",
+        ]
         return "\n".join(lines) + "\n"
+    steps = _recipe_steps(spec, strip=strip)
     if kind != "apptainer":
         raise BackendEnvError(f"Unknown recipe type '{kind}'")
     lines = [

@@ -102,9 +102,16 @@ def test_recipe_installs_the_same_pins_as_the_env():
 
 def test_docker_recipe_is_a_dockerfile():
     recipe = container_recipe(spec_for("opendde"), kind="docker")
-    assert recipe.splitlines()[1].startswith("FROM ")
-    assert "RUN micromamba create" in recipe
-    assert "opendde==1.2.0" in recipe
+    assert recipe.splitlines()[0] == "# syntax=docker/dockerfile:1.7"
+    assert "FROM " in recipe
+    assert "--mount=type=cache,target=/root/.cache/uv" in recipe
+    assert "COPY --from=builder /opt/abcfold /opt/abcfold" in recipe
+    assert "micromamba create" in recipe
+    assert "opendde[gpu]==1.2.0" in recipe or "opendde==1.2.0" in recipe
+    assert "pip install --no-cache-dir uv" not in recipe
+    jax_recipe = container_recipe(spec_for("intellifold"), kind="docker")
+    assert "gcr.io/distroless/cc-debian12" in jax_recipe
+    assert "COPY --from=builder /usr/bin/env /usr/bin/env" in jax_recipe
 
 
 def test_keep_unused_recipe_keeps_the_wheels():
