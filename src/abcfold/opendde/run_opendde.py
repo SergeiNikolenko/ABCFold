@@ -1,8 +1,11 @@
+import json
 import logging
+import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional, Union
+from typing import Iterable, Optional, Tuple, Union
 
 from abcfold.gpus import cuda_env
 from abcfold.opendde.af3_to_opendde import OpenDDEjson
@@ -109,6 +112,128 @@ def run_opendde(
     return True
 
 
+def _gpu_slot_list(gpus: Optional[str]) -> list[Optional[str]]:
+    if gpus in (None, "all", "cpu"):
+        return [gpus]
+    slots: list[Optional[str]] = [
+        g.strip() for g in str(gpus).split(",") if g.strip()
+    ]
+    return slots or ["all"]
+
+
+def run_opendde_batch(
+    items: Iterable[Tuple[Union[str, Path], Union[str, Path]]],
+    config: dict,
+    save_input: bool = False,
+    test: bool = False,
+    number_of_models: int = 5,
+    num_recycles: int = 10,
+    gpus: Optional[str] = "all",
+) -> dict[Path, bool]:
+    """Run many OpenDDE jobs in one invocation per GPU (weights loaded once)."""
+    item_list = [(Path(inp), Path(out)) for inp, out in items]
+    if not item_list:
+        return {}
+    if test:
+        return {out: True for _, out in item_list}
+
+    env = ensure_opendde_env(config=config)
+    gpu_slots = _gpu_slot_list(gpus)
+    results: dict[Path, bool] = {out: False for _, out in item_list}
+
+    with tempfile.TemporaryDirectory(prefix="abcfold-opendde-batch-") as temp_dir:
+        work_root = Path(temp_dir)
+        groups: dict[tuple[tuple[int, ...], bool], list[tuple[Path, dict]]] = {}
+        for idx, (inp, job_out) in enumerate(item_list):
+            job_out.mkdir(parents=True, exist_ok=True)
+            working_dir = (
+                input_dir_for(job_out, "opendde")
+                if save_input
+                else work_root / f"job_{idx}"
+            )
+            working_dir.mkdir(parents=True, exist_ok=True)
+            oj = OpenDDEjson(working_dir)
+            entry = oj.json_to_json(inp)
+            key = (tuple(int(s) for s in (oj.seeds or [42])), bool(oj.uses_msa))
+            groups.setdefault(key, []).append((job_out, entry))
+
+        def _run_shard(
+            shard_idx: int,
+            seeds_key: tuple[int, ...],
+            use_msa: bool,
+            shard_items: list[tuple[Path, dict]],
+            gpu_slot: Optional[str],
+        ) -> None:
+            shard_dir = work_root / f"shard_{shard_idx}"
+            shard_dir.mkdir(parents=True, exist_ok=True)
+            batch_json = shard_dir / "opendde_batch.json"
+            batch_json.write_text(json.dumps([it[1] for it in shard_items], indent=2))
+            batch_out = shard_dir / "opendde_results"
+            cmd = generate_opendde_command(
+                batch_json,
+                batch_out,
+                config,
+                number_of_models,
+                list(seeds_key),
+                use_msa=use_msa,
+                num_recycles=num_recycles,
+            )
+            extra_env = cuda_env(gpu_slot)
+            root_dir = config.get("opendde_root_dir")
+            if root_dir:
+                extra_env["OPENDDE_ROOT_DIR"] = str(Path(str(root_dir)).expanduser())
+            try:
+                env.run(cmd, extra_env=extra_env)
+            except subprocess.CalledProcessError as exc:
+                for job_out, _ in shard_items:
+                    if exc.stderr:
+                        (job_out / "opendde_error.log").write_text(exc.stderr)
+                return
+            for job_out, entry in shard_items:
+                job_name = entry["name"]
+                src = batch_out / job_name
+                dst_root = job_out / "opendde_results"
+                dst = dst_root / job_name
+                if src.exists() and list(src.rglob("*.cif")):
+                    if dst.exists():
+                        shutil.rmtree(dst)
+                    dst_root.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src), str(dst))
+                    results[job_out] = True
+
+        tasks = []
+        shard_counter = 0
+        for (seeds_key, use_msa), group_items in groups.items():
+            n_shards = min(len(gpu_slots), len(group_items))
+            shards: list[list[tuple[Path, dict]]] = [[] for _ in range(n_shards)]
+            for idx, item in enumerate(group_items):
+                shards[idx % n_shards].append(item)
+            for slot_idx, shard_items in enumerate(shards):
+                tasks.append(
+                    (
+                        shard_counter,
+                        seeds_key,
+                        use_msa,
+                        shard_items,
+                        gpu_slots[slot_idx],
+                    )
+                )
+                shard_counter += 1
+
+        if len(tasks) > 1 and len(gpu_slots) > 1:
+            with ThreadPoolExecutor(
+                max_workers=min(len(gpu_slots), len(tasks))
+            ) as pool:
+                futs = [pool.submit(_run_shard, *t) for t in tasks]
+                for fut in as_completed(futs):
+                    fut.result()
+        else:
+            for t in tasks:
+                _run_shard(*t)
+
+    return results
+
+
 def generate_opendde_command(
     input_json: Union[str, Path],
     output_dir: Union[str, Path],
@@ -117,6 +242,7 @@ def generate_opendde_command(
     seeds: Union[list, None] = None,
     use_msa: bool = False,
     num_recycles: int = 10,
+    use_tfg_guidance: bool = False,
 ) -> list:
     """
     Generate the OpenDDE command
@@ -160,6 +286,8 @@ def generate_opendde_command(
         "--use_rna_msa",
         "false",
     ]
+    if use_tfg_guidance:
+        cmd += ["--use_tfg_guidance", "true"]
 
     return cmd
 

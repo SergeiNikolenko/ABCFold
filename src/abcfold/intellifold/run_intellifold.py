@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional, Union
 
+from abcfold.backend_envs import jax_cache_dir, jax_runtime_env
 from abcfold.gpus import cuda_env
 from abcfold.intellifold.af3_to_intellifold import Intellifoldjson
 from abcfold.intellifold.check_install import ensure_intellifold_env
@@ -73,6 +74,8 @@ def run_intellifold(
 
         intellifold_out_dir = output_dir / "intellifold_results"
         logger.info("Running IntelliFold using seeds: %s", intellifold_json.seeds)
+        cache_dir = jax_cache_dir(config)
+        cache_dir.mkdir(parents=True, exist_ok=True)
         cmd = (
             generate_intellifold_command(
                 out_file,
@@ -80,13 +83,15 @@ def run_intellifold(
                 model_dir,
                 number_of_models,
                 num_recycles=num_recycles,
+                jax_compilation_cache_dir=cache_dir,
             )
             if not test
             else generate_intellifold_test_command()
         )
 
+        extra_env = {**jax_runtime_env(config), **cuda_env(gpus)}
         try:
-            env.run(cmd, extra_env=cuda_env(gpus))
+            env.run(cmd, extra_env=extra_env)
         except subprocess.CalledProcessError as e:
             stderr = e.stderr or ""
             if stderr:
@@ -113,6 +118,7 @@ def generate_intellifold_command(
     model_dir: Union[str, Path],
     number_of_models: int = 5,
     num_recycles: int = 10,
+    jax_compilation_cache_dir: Optional[Union[str, Path]] = None,
 ) -> list:
     """
     Generate the IntelliFold command
@@ -147,6 +153,11 @@ def generate_intellifold_command(
         "--force_output_dir",
         "--norun_data_pipeline",
         "--resolve_msa_overlaps=false",
+        *(
+            [f"--jax_compilation_cache_dir={jax_compilation_cache_dir}"]
+            if jax_compilation_cache_dir
+            else []
+        ),
     ]
 
 

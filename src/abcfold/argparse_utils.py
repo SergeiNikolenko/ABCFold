@@ -327,6 +327,13 @@ def boltz_argparse_util(parser):
         help=dedent("[optional] Boltz maximum parallel diffusion samples. Leave unset \
         until an OOM boundary has been validated."),
     )
+    parser.add_argument(
+        "--boltz_use_potentials",
+        action="store_true",
+        default=False,
+        help=dedent("[optional] Enable Boltz-2 physical steering potentials during \
+        diffusion sampling (slower, off by default)."),
+    )
 
     return parser
 

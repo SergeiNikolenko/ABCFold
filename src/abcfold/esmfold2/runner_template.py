@@ -2,13 +2,17 @@
 
 ESMFold2 exposes no command line interface, so abcfold writes this script next
 to the converted input and runs it with the environment's interpreter. It reads
-the input description produced by ``Esmfold2json``, folds it once per seed and
-writes mmCIF models plus AlphaFold3 style confidence summaries.
+either a single input description or a multi-job --manifest, loads the
+EsmFold2Model once onto GPU with TF32 + inference_mode, folds every job/seed,
+and writes mmCIF models plus AlphaFold3 style confidence summaries.
 
-Usage: python runner.py <input_description.json> <output_dir> <options.json>
+Usage:
+    python runner.py <input_description.json> <output_dir> <options.json>
+    python runner.py --manifest <manifest.json>
 """
 
 import csv
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -68,41 +72,47 @@ def normalise_plddt(plddt):
     return value * 100 if value <= 1.0 else value
 
 
-def main():
-    description_path, output_arg, options_path = sys.argv[1:4]
-    description = json.loads(Path(description_path).read_text())
-    options = json.loads(Path(options_path).read_text())
-    output_dir = Path(output_arg)
+def _configure_torch():
+    import torch
 
-    import esm.models.esmfold2 as esm_mod
-    from esm.models.esmfold2 import ESMFold2InputBuilder, EsmFold2Model
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    return torch
 
+
+def _fold_job(builder, model, esm_mod, torch_mod, description, output_dir, options):
     name = description.get("name") or "prediction"
-    builder = ESMFold2InputBuilder()
     structure_input = build_input(description, esm_mod)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    model = EsmFold2Model.from_pretrained(
-        options["model_repo"], device=options["device"]
-    ).eval()
+    fold_params = inspect.signature(builder.fold).parameters
+    extra_fold_kwargs = {}
+    if "mode" in fold_params:
+        requested_mode = options.get("fold_mode")
+        if requested_mode:
+            extra_fold_kwargs["mode"] = requested_mode
+        elif torch_mod.cuda.is_available():
+            extra_fold_kwargs["mode"] = "fused"
 
     ranking_rows = []
     for seed in description["seeds"]:
         seed_dir = output_dir / "esmfold2_results_seed-{}".format(seed)
         seed_dir.mkdir(parents=True, exist_ok=True)
 
-        results = builder.fold(
-            model,
-            structure_input,
-            num_loops=options["num_loops"],
-            num_sampling_steps=options["num_sampling_steps"],
-            num_diffusion_samples=options["num_diffusion_samples"],
-            seed=seed,
-            # A fresh language-model mask per loop would make repeated folds
-            # diverge even at a fixed seed.
-            lm_dropout=0.0,
-            complex_id=name,
-        )
-        # fold returns a bare result when a single sample is requested.
+        with torch_mod.inference_mode():
+            results = builder.fold(
+                model,
+                structure_input,
+                num_loops=options["num_loops"],
+                num_sampling_steps=options["num_sampling_steps"],
+                num_diffusion_samples=options["num_diffusion_samples"],
+                seed=seed,
+                lm_dropout=0.0,
+                complex_id=name,
+                **extra_fold_kwargs,
+            )
         if not isinstance(results, list):
             results = [results]
 
@@ -115,8 +125,6 @@ def main():
             ptm = float(result.ptm) if result.ptm is not None else None
             iptm = float(result.iptm) if result.iptm is not None else None
             plddt = normalise_plddt(result.plddt)
-            # ESMFold2 reports no ranking score of its own; this mirrors the
-            # AlphaFold3 definition so downstream ranking stays comparable.
             if iptm is not None and ptm is not None:
                 ranking_score = 0.8 * iptm + 0.2 * ptm
             elif ptm is not None:
@@ -137,7 +145,10 @@ def main():
 
             if result.pae is not None:
                 (seed_dir / "{}_confidences.json".format(stem)).write_text(
-                    json.dumps({"pae": result.pae.tolist()})
+                    json.dumps(
+                        {"pae": result.pae.tolist()},
+                        separators=(",", ":"),
+                    )
                 )
 
             ranking_rows.append([seed, index, ranking_score])
@@ -146,6 +157,45 @@ def main():
         writer = csv.writer(handle)
         writer.writerow(["seed", "sample", "ranking_score"])
         writer.writerows(ranking_rows)
+
+
+def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--manifest":
+        manifest = json.loads(Path(sys.argv[2]).read_text())
+        jobs = manifest["jobs"]
+        base_options = manifest["options"]
+    else:
+        description_path, output_arg, options_path = sys.argv[1:4]
+        base_options = json.loads(Path(options_path).read_text())
+        jobs = [
+            {
+                "description": description_path,
+                "output_dir": output_arg,
+                "options": base_options,
+            }
+        ]
+
+    torch_mod = _configure_torch()
+    import esm.models.esmfold2 as esm_mod
+    from esm.models.esmfold2 import ESMFold2InputBuilder, EsmFold2Model
+
+    builder = ESMFold2InputBuilder()
+    model = EsmFold2Model.from_pretrained(
+        base_options["model_repo"], device=base_options["device"]
+    ).eval()
+
+    for job in jobs:
+        description = json.loads(Path(job["description"]).read_text())
+        options = job.get("options") or base_options
+        _fold_job(
+            builder,
+            model,
+            esm_mod,
+            torch_mod,
+            description,
+            Path(job["output_dir"]),
+            options,
+        )
 
 
 if __name__ == "__main__":

@@ -14,6 +14,8 @@ from abcfold.output.atoms import VANDERWALLS
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_CCD_SMILES_CACHE: Dict[str, Optional[str]] = {}
+
 
 ATOMS_NAMES = sorted(list(VANDERWALLS.keys()), key=len, reverse=True)
 
@@ -277,6 +279,11 @@ check back for updates"
     def ccd_to_smiles(self, ccd_id: str):
 
         assert isinstance(ccd_id, str), "CCD ID must be a string"
+        if not self.__create_files:
+            # Post-processing callers only need chain_ids, never remote SMILES.
+            return _CCD_SMILES_CACHE.get(ccd_id)
+        if ccd_id in _CCD_SMILES_CACHE:
+            return _CCD_SMILES_CACHE[ccd_id]
         logger.info(f"CCD code found in input: {ccd_id}")
         logger.info("Chai-1 currently only supports SMILES strings for ligands")
         logger.info("Attempting to retrieve SMILES from CCD")
@@ -290,6 +297,7 @@ check back for updates"
                 ccd_data = descriptor.get("SMILES") or descriptor.get("SMILES_stereo")
                 if ccd_data:
                     logger.info(f"SMILES retrieved from RCSB: {ccd_data}")
+                    _CCD_SMILES_CACHE[ccd_id] = ccd_data
                     return ccd_data
         except requests.RequestException as exc:
             logger.warning("RCSB lookup failed for %s: %s", ccd_id, exc)
@@ -303,6 +311,7 @@ check back for updates"
         if response.status_code == 200:
             ccd_data = response.text
             logger.info(f"SMILES retrieved from Cactus: {ccd_data}")
+            _CCD_SMILES_CACHE[ccd_id] = ccd_data
             return ccd_data
 
         logger.warning(f"Could not retrieve SMILES for {ccd_id}")

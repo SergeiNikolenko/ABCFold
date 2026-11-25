@@ -52,6 +52,9 @@ class BoltzYaml:
         cache_key = ccd_id.upper()
         if cache_key in CCD_SMILES_CACHE:
             return CCD_SMILES_CACHE[cache_key]
+        if not self.__create_files:
+            # Post-processing callers (e.g. BoltzOutput) only inspect chain_ids.
+            return None
 
         logger.info("Attempting to retrieve SMILES for CCD %s", ccd_id)
         try:

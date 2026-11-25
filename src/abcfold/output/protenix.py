@@ -1,4 +1,5 @@
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Union
 
@@ -83,7 +84,7 @@ class ProtenixOutput:
 
         new_output_dirs = []
         for output_dir in self.output_dirs:
-            if output_dir.name.startswith("protenix_results_"):
+            if output_dir.name.startswith("protenix_results"):
                 new_path = new_parent / output_dir.name
                 output_dir.rename(new_path)
                 new_output_dirs.append(new_path)
@@ -120,16 +121,26 @@ class ProtenixOutput:
         """
         file_groups: Dict[str, Dict[int, list]] = {}
         for pathway in self.output_dirs:
-            seed = pathway.name.split("_")[-1]
-            if seed not in file_groups:
-                file_groups[seed] = {}
+            fallback_seed = pathway.name.split("_")[-1]
 
             for output in pathway.rglob("*"):
-                number = None
                 number_str = output.stem.split("_sample_")[-1]
                 if not number_str.isdigit():
                     continue
                 number = int(number_str)
+
+                seed = fallback_seed
+                try:
+                    rel_parts = output.relative_to(pathway).parts
+                except ValueError:
+                    rel_parts = output.parts
+                for part in reversed(rel_parts[:-1]):
+                    if part.startswith("seed_"):
+                        seed = "seed-" + part[len("seed_"):]
+                        break
+                    if part.startswith("seed-"):
+                        seed = part
+                        break
 
                 file_type = output.suffix[1:]
 
@@ -142,6 +153,8 @@ class ProtenixOutput:
                     file_ = ConfidenceJsonFile(str(output))
                 else:
                     continue
+                if seed not in file_groups:
+                    file_groups[seed] = {}
                 if number not in file_groups[seed]:
                     file_groups[seed][number] = [file_]
                 else:
@@ -185,23 +198,28 @@ class ProtenixOutput:
         Returns:
             None
         """
-        new_pae_files: Dict[str, list] = {}
-        for seed in self.seeds:
-            for (pae_file, cif_file) in zip(
+        def _convert(item):
+            seed, pae_file, cif_file = item
+            pae = Af3Pae.from_protenix(pae_file.data, cif_file)
+            out_name = af3_pae_path(cif_file)
+            pae.to_file(out_name)
+            return seed, ConfidenceJsonFile(out_name, data=pae.scores)
+
+        tasks = [
+            (seed, pae_file, cif_file)
+            for seed in self.seeds
+            for pae_file, cif_file in zip(
                 self.pae_files[seed], self.cif_files[seed]
-            ):
-                pae = Af3Pae.from_protenix(
-                    pae_file.data,
-                    cif_file,
-                )
-
-                out_name = af3_pae_path(cif_file)
-
-                pae.to_file(out_name)
-
-                if seed not in new_pae_files:
-                    new_pae_files[seed] = []
-                new_pae_files[seed].append(ConfidenceJsonFile(out_name))
+            )
+        ]
+        new_pae_files: dict[str, list[ConfidenceJsonFile]] = {}
+        if len(tasks) > 1:
+            with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as pool:
+                results = list(pool.map(_convert, tasks))
+        else:
+            results = [_convert(t) for t in tasks]
+        for seed, cjf in results:
+            new_pae_files.setdefault(seed, []).append(cjf)
 
         self.output = {
             seed: {

@@ -265,7 +265,9 @@ class Af3Pae:
         af3_scores["pae"] = pae_matrix.tolist()
         af3_scores["atom_chain_ids"] = atom_chain_ids
         af3_scores["atom_plddts"] = atom_plddts
-        af3_scores["contact_probs"] = np.zeros(shape=pae_matrix.shape).tolist()
+        af3_scores["contact_probs"] = [
+            [0.0] * pae_matrix.shape[1] for _ in range(pae_matrix.shape[0])
+        ]
         af3_scores["token_chain_ids"] = token_chain_ids
         af3_scores["token_res_ids"] = token_res_ids
 
@@ -298,7 +300,9 @@ class Af3Pae:
         af3_scores["pae"] = pae_matrix.tolist()
         af3_scores["atom_chain_ids"] = atom_chain_ids
         af3_scores["atom_plddts"] = atom_plddts
-        af3_scores["contact_probs"] = np.zeros(shape=pae_matrix.shape).tolist()
+        af3_scores["contact_probs"] = [
+            [0.0] * pae_matrix.shape[1] for _ in range(pae_matrix.shape[0])
+        ]
         af3_scores["token_chain_ids"] = token_chain_ids
         af3_scores["token_res_ids"] = token_res_ids
 
@@ -331,7 +335,9 @@ class Af3Pae:
         af3_scores["pae"] = pae_matrix.tolist()
         af3_scores["atom_chain_ids"] = atom_chain_ids
         af3_scores["atom_plddts"] = atom_plddts
-        af3_scores["contact_probs"] = np.zeros(shape=pae_matrix.shape).tolist()
+        af3_scores["contact_probs"] = [
+            [0.0] * pae_matrix.shape[1] for _ in range(pae_matrix.shape[0])
+        ]
         af3_scores["token_chain_ids"] = token_chain_ids
         af3_scores["token_res_ids"] = token_res_ids
 
@@ -364,7 +370,9 @@ class Af3Pae:
         af3_scores["pae"] = pae_matrix.tolist()
         af3_scores["atom_chain_ids"] = atom_chain_ids
         af3_scores["atom_plddts"] = atom_plddts
-        af3_scores["contact_probs"] = np.zeros(shape=pae_matrix.shape).tolist()
+        af3_scores["contact_probs"] = [
+            [0.0] * pae_matrix.shape[1] for _ in range(pae_matrix.shape[0])
+        ]
         af3_scores["token_chain_ids"] = token_chain_ids
         af3_scores["token_res_ids"] = token_res_ids
 
@@ -405,7 +413,9 @@ class Af3Pae:
         af3_scores["pae"] = pae_matrix.tolist()
         af3_scores["atom_chain_ids"] = atom_chain_ids
         af3_scores["atom_plddts"] = atom_plddts
-        af3_scores["contact_probs"] = np.zeros(shape=pae_matrix.shape).tolist()
+        af3_scores["contact_probs"] = [
+            [0.0] * pae_matrix.shape[1] for _ in range(pae_matrix.shape[0])
+        ]
         af3_scores["token_chain_ids"] = token_chain_ids
         af3_scores["token_res_ids"] = token_res_ids
 
@@ -415,8 +425,10 @@ class Af3Pae:
         self.scores = af3_scores
 
     def to_file(self, file_path: Union[str, Path]):
+        # Compact JSON uses Python's C encoder directly (~20x faster and ~6x
+        # smaller than indent=4 on large N x N PAE matrices).
         with open(file_path, "w") as f:
-            json.dump(self.scores, f, indent=4)
+            f.write(json.dumps(self.scores, separators=(",", ":")))
 
 
 def flatten(xss):

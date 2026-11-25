@@ -1,6 +1,8 @@
+import copy
 import json
 import logging
 import os
+import queue
 import shutil
 import socketserver
 import sys
@@ -8,9 +10,10 @@ import tempfile
 import time
 import traceback
 import webbrowser
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from abcfold.argparse_utils import (alphafold_argparse_util,
                                     boltz_argparse_util, chai_argparse_util,
@@ -182,6 +185,19 @@ def _write_json(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
+def _parse_gpu_slots(gpus: Optional[str]) -> List[Optional[str]]:
+    """Split an explicit comma-separated --gpus list into individual GPU slots."""
+    if gpus is None:
+        return [None]
+    raw = str(gpus).strip()
+    if not raw or raw.lower() in ("all", "cpu"):
+        return [raw or "all"]
+    slots: List[Optional[str]] = [
+        part.strip() for part in raw.split(",") if part.strip()
+    ]
+    return slots or ["all"]
+
+
 def run(args, settings: Optional[Settings] = None) -> int:
     """Run ABCFold and return the exit code (0 ok, 2 partial, 1 failed)."""
     args.output_dir = Path(args.output_dir)
@@ -283,82 +299,209 @@ def run(args, settings: Optional[Settings] = None) -> int:
             logger.error(str(exc))
             precheck_error = str(exc)
 
-        runners: Dict[str, Callable[[], EngineOutcome]] = {
-            "alphafold3": lambda: _run_alphafold3(
-                args, rt_config, run_json, input_params, temp_dir, name
-            ),
-            "boltz": lambda: _run_boltz(args, rt_config, run_json, input_params,
-                                        name),
-            "chai1": lambda: _run_chai(args, rt_config, run_json, input_params,
-                                       temp_dir, name),
-            "protenix": lambda: _run_protenix(args, rt_config, run_json,
-                                              input_params, name),
-            "openfold3": lambda: _run_openfold(args, rt_config, run_json,
-                                               input_params, temp_dir, name),
-            "rosettafold3": lambda: _run_rosettafold(args, rt_config, run_json,
-                                                     input_params, name),
-            "intellifold": lambda: _run_intellifold(args, rt_config, run_json,
-                                                    input_params, name),
-            "opendde": lambda: _run_opendde(args, rt_config, run_json,
-                                            input_params, name),
-            "esmfold2": lambda: _run_esmfold2(args, rt_config, run_json,
-                                              input_params, name),
-        }
+        def _dispatch_engine(
+            engine: str,
+            engine_args: Any,
+            params_snapshot: dict,
+        ) -> EngineOutcome:
+            if engine == "alphafold3":
+                return _run_alphafold3(
+                    engine_args, rt_config, run_json, params_snapshot, temp_dir, name
+                )
+            if engine == "boltz":
+                return _run_boltz(
+                    engine_args, rt_config, run_json, params_snapshot, name
+                )
+            if engine == "chai1":
+                return _run_chai(
+                    engine_args, rt_config, run_json, params_snapshot, temp_dir, name
+                )
+            if engine == "protenix":
+                return _run_protenix(
+                    engine_args, rt_config, run_json, params_snapshot, name
+                )
+            if engine == "openfold3":
+                return _run_openfold(
+                    engine_args, rt_config, run_json, params_snapshot, temp_dir, name
+                )
+            if engine == "rosettafold3":
+                return _run_rosettafold(
+                    engine_args, rt_config, run_json, params_snapshot, name
+                )
+            if engine == "intellifold":
+                return _run_intellifold(
+                    engine_args, rt_config, run_json, params_snapshot, name
+                )
+            if engine == "opendde":
+                return _run_opendde(
+                    engine_args, rt_config, run_json, params_snapshot, name
+                )
+            if engine == "esmfold2":
+                return _run_esmfold2(
+                    engine_args, rt_config, run_json, params_snapshot, name
+                )
+            raise ValueError(f"Unknown engine: {engine}")
 
-        for engine in engines:
-            record = records[engine]
-            record.version = settings.backend(engine).get("version")
+        def _execute_engine(
+            engine: str,
+            engine_args: Any,
+            params_snapshot: dict,
+        ) -> Tuple[str, EngineOutcome, float, float]:
             logger.info("Running %s", DISPLAY_NAMES[engine])
             start = time.monotonic()
             wall_start = time.time() - 1
-            if precheck_error is not None:
-                record.status = "failed"
-                record.error = precheck_error
-                record.seconds = 0.0
-                continue
             try:
-                outcome = runners[engine]()
+                outcome = _dispatch_engine(engine, engine_args, params_snapshot)
             except SystemExit as exc:
                 outcome = EngineOutcome(False, error=f"exited with {exc.code}")
             except Exception as exc:  # one backend must not stop the others
                 logger.error("%s failed: %s", DISPLAY_NAMES[engine], exc)
                 logger.debug(traceback.format_exc())
                 outcome = EngineOutcome(False, error=f"{type(exc).__name__}: {exc}")
-            record.seconds = time.monotonic() - start
-            if outcome.ok:
-                record.status = "ok"
-                if outcome.output is not None:
-                    outputs.append((engine, outcome.output))
-                    try:
-                        n = sum(
-                            1 for models in outcome.output.output.values()
-                            for idx in models if not (isinstance(idx, int) and idx < 0)
-                        )
-                        record.samples = samples_from_output(
-                            engine, record.version, outcome.output.output,
-                            args.output_dir,
-                            seconds_per_sample=(record.seconds / n) if n else None,
-                        )
-                    except Exception as exc:
-                        logger.warning("Could not summarise %s samples: %s",
-                                       engine, exc)
-            else:
-                record.status = "failed"
-                record.error = (
-                    outcome.error
-                    or _error_from_logs(args.output_dir, wall_start)
-                    or "backend produced no structures"
+            return engine, outcome, time.monotonic() - start, wall_start
+
+        def _summarise_outcome(
+            engine: str,
+            record: EngineRecord,
+            outcome: EngineOutcome,
+        ) -> None:
+            if outcome.output is None:
+                return
+            try:
+                n = sum(
+                    1
+                    for models in outcome.output.output.values()
+                    for idx in models
+                    if not (isinstance(idx, int) and idx < 0)
                 )
-                logger.error("%s failed: %s", DISPLAY_NAMES[engine],
-                             record.error.splitlines()[0] if record.error else "")
-            if engine == "alphafold3" and outcome.ok:
-                # AF3 may have produced MSAs that the other backends can reuse
-                if max_msa_seqs:
-                    input_params = limit_json_msa_depth(
-                        run_json, run_json, max_msa_seqs
-                    )
+                record.samples = samples_from_output(
+                    engine,
+                    record.version,
+                    outcome.output.output,
+                    args.output_dir,
+                    seconds_per_sample=(
+                        (record.seconds / n)
+                        if (n and record.seconds is not None)
+                        else None
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("Could not summarise %s samples: %s", engine, exc)
+
+        outcomes_by_engine: Dict[str, EngineOutcome] = {}
+        if precheck_error is not None:
+            for engine in engines:
+                record = records[engine]
+                record.version = settings.backend(engine).get("version")
+                record.status = "failed"
+                record.error = precheck_error
+                record.seconds = 0.0
+        else:
+            gpu_slots = _parse_gpu_slots(getattr(args, "gpus", "all"))
+            af3_first = [e for e in engines if e == "alphafold3"]
+            remaining_engines = [e for e in engines if e != "alphafold3"]
+            summary_futures: List[Future[None]] = []
+
+            def _record_result(
+                engine: str,
+                outcome: EngineOutcome,
+                elapsed: float,
+                wall_start: float,
+                summary_pool: ThreadPoolExecutor,
+            ) -> None:
+                record = records[engine]
+                record.version = settings.backend(engine).get("version")
+                record.seconds = elapsed
+                outcomes_by_engine[engine] = outcome
+                if outcome.ok:
+                    record.status = "ok"
+                    if outcome.output is not None:
+                        summary_futures.append(
+                            summary_pool.submit(
+                                _summarise_outcome, engine, record, outcome
+                            )
+                        )
                 else:
-                    input_params = json.loads(run_json.read_text())
+                    record.status = "failed"
+                    record.error = (
+                        outcome.error
+                        or _error_from_logs(args.output_dir, wall_start)
+                        or "backend produced no structures"
+                    )
+                    logger.error(
+                        "%s failed: %s",
+                        DISPLAY_NAMES[engine],
+                        record.error.splitlines()[0] if record.error else "",
+                    )
+
+            with ThreadPoolExecutor(
+                max_workers=min(4, max(1, len(engines)))
+            ) as summary_pool:
+                for engine in af3_first:
+                    eng, outcome, elapsed, wall_start = _execute_engine(
+                        engine, args, input_params
+                    )
+                    _record_result(eng, outcome, elapsed, wall_start, summary_pool)
+                    if outcome.ok:
+                        if max_msa_seqs:
+                            input_params = limit_json_msa_depth(
+                                run_json, run_json, max_msa_seqs
+                            )
+                        else:
+                            input_params = json.loads(run_json.read_text())
+
+                if len(gpu_slots) > 1 and len(remaining_engines) > 1:
+                    logger.info(
+                        "Dispatching %d engines in parallel across %d GPUs (%s)",
+                        len(remaining_engines),
+                        len(gpu_slots),
+                        ",".join(str(g) for g in gpu_slots),
+                    )
+                    slot_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+                    for slot in gpu_slots:
+                        slot_queue.put(slot)
+
+                    def _run_on_slot(
+                        engine: str,
+                    ) -> Tuple[str, EngineOutcome, float, float]:
+                        slot = slot_queue.get()
+                        try:
+                            engine_args = copy.copy(args)
+                            engine_args.gpus = slot
+                            return _execute_engine(engine, engine_args, input_params)
+                        finally:
+                            slot_queue.put(slot)
+
+                    with ThreadPoolExecutor(
+                        max_workers=min(len(gpu_slots), len(remaining_engines))
+                    ) as gpu_pool:
+                        futs = [
+                            gpu_pool.submit(_run_on_slot, eng)
+                            for eng in remaining_engines
+                        ]
+                        for fut in as_completed(futs):
+                            eng, outcome, elapsed, wall_start = fut.result()
+                            _record_result(
+                                eng, outcome, elapsed, wall_start, summary_pool
+                            )
+                else:
+                    for engine in remaining_engines:
+                        eng, outcome, elapsed, wall_start = _execute_engine(
+                            engine, args, input_params
+                        )
+                        _record_result(eng, outcome, elapsed, wall_start, summary_pool)
+
+                for sfut in summary_futures:
+                    sfut.result()
+
+            for engine in engines:
+                outcome_opt = outcomes_by_engine.get(engine)
+                if (
+                    outcome_opt is not None
+                    and outcome_opt.ok
+                    and outcome_opt.output is not None
+                ):
+                    outputs.append((engine, outcome_opt.output))
 
         affinity_scores: Dict[str, Dict[str, Any]] = {}
         if outputs and (
@@ -562,6 +705,7 @@ def _run_boltz(args, rt_config, run_json, input_params, name) -> EngineOutcome:
         num_workers=args.boltz_num_workers,
         max_parallel_samples=args.boltz_max_parallel_samples,
         sampling_steps=args.diffusion_steps or 200,
+        boltz_use_potentials=bool(getattr(args, "boltz_use_potentials", False)),
     )
     if not ok:
         return EngineOutcome(False)
@@ -755,7 +899,7 @@ def render_html(
     index_counter = 0
 
     programs_run: List[str] = []
-    combined_models: List[Dict[str, Any]] = []
+    model_jobs = []
     for engine, out in outputs:
         programs_run.append(DISPLAY_NAMES[engine])
         for seed in out.output.keys():
@@ -764,7 +908,6 @@ def render_html(
                     continue
                 files = out.output[seed][idx]
                 model = files["cif"]
-                model.check_clashes()
                 score_file = next(
                     (files[k] for k in ("summary", "json", "scores", "score")
                      if files.get(k) is not None),
@@ -774,11 +917,27 @@ def render_html(
                 if len(indicies) > 0:
                     plddt = insert_none_by_minus_one(indicies[index_counter], plddt)
                 index_counter += 1
-                combined_models.append(get_model_data(
-                    model, plot_dict, DISPLAY_NAMES[engine], plddt,
-                    files["af3_pae"], score_file, output_dir,
-                    affinity_scores=affinity_scores,
+                model_jobs.append((
+                    model, DISPLAY_NAMES[engine], plddt,
+                    files["af3_pae"], score_file,
                 ))
+
+    def _score_one(job):
+        model, method, plddt, pae_obj, score_file = job
+        model.check_clashes()
+        return get_model_data(
+            model, plot_dict, method, plddt,
+            pae_obj, score_file, output_dir,
+            affinity_scores=affinity_scores,
+        )
+
+    if len(model_jobs) > 1:
+        with ThreadPoolExecutor(max_workers=min(8, len(model_jobs))) as pool:
+            combined_models: List[Dict[str, Any]] = list(
+                pool.map(_score_one, model_jobs)
+            )
+    else:
+        combined_models = [_score_one(j) for j in model_jobs]
 
     prefix_by_display = {DISPLAY_NAMES[e]: MODEL_PREFIX[e] for e in DISPLAY_NAMES}
     models_dir = output_dir.joinpath("output_models")

@@ -1,6 +1,7 @@
 import contextlib
 import http.server
 import io
+import threading
 import json
 import logging
 import textwrap
@@ -32,6 +33,7 @@ except ImportError:  # pragma: no cover - optional dependency
 
 PORT = 8000
 logger = logging.getLogger("logger")
+_STDOUT_LOCK = threading.Lock()
 
 
 def get_plddt_regions(plddts: Union[np.ndarray, list]) -> dict:
@@ -167,24 +169,35 @@ def get_model_data(model,
     reactifptm_score = []
     if Reactifptm is not None:
         try:
-            with contextlib.redirect_stdout(io.StringIO()):
+            pae_existing = getattr(pae_obj, "pathway", None)
+            existing_path = Path(pae_existing) if pae_existing is not None else None
+            reuse_existing = (
+                existing_path is not None
+                and existing_path.is_file()
+                and existing_path.suffix == ".json"
+            )
+            if reuse_existing and existing_path is not None:
+                pae_json = existing_path
+            else:
                 pae_json = (
                     full_model_path.parent
                     / f"{Path(model_path).stem}_pae_af3.json"
                 )
                 with open(pae_json, "w") as fh:
-                    json.dump(ipsae.pae_data, fh)
-                try:
-                    reactif = Reactifptm(pae_json, full_model_path)
-                    reactif.compute_reactifptm()
-                    for pair, v in (reactif.reactifptm_pairwise_max or {}).items():
-                        pair_label = str(pair).replace("-", "")
-                        reactifptm_score.append(f"{pair_label}:{np.round(v, 4)}")
+                    fh.write(json.dumps(ipsae.pae_data, separators=(",", ":")))
+            try:
+                reactif = Reactifptm(pae_json, full_model_path)
+                reactif.compute_reactifptm()
+                for pair, v in (reactif.reactifptm_pairwise_max or {}).items():
+                    pair_label = str(pair).replace("-", "")
+                    reactifptm_score.append(f"{pair_label}:{np.round(v, 4)}")
+                with _STDOUT_LOCK, contextlib.redirect_stdout(io.StringIO()):
                     reactif.save_results(
                         full_model_path.parent
                         / f"{Path(model_path).stem}_reactifptm.json"
                     )
-                finally:
+            finally:
+                if not reuse_existing:
                     pae_json.unlink(missing_ok=True)
         except Exception as exc:  # noqa: BLE001
             logger.warning("reactifPTM failed for %s: %s", model.name, exc)

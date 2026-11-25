@@ -25,6 +25,51 @@ logger = logging.getLogger("logger")
 
 CURRENT_ENV = "@current"
 FORBIDDEN_PACKAGES = ("rdkit-pypi",)
+_VERIFY_CACHE: Dict[tuple, str] = {}
+_WHICH_CACHE: Dict[tuple, bool] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def clear_env_caches() -> None:
+    """Clear in-process backend verification caches (called after build/pull)."""
+    with _CACHE_LOCK:
+        _VERIFY_CACHE.clear()
+        _WHICH_CACHE.clear()
+
+
+def jax_cache_dir(config: Optional[Mapping] = None) -> Path:
+    """Return a persistent directory for JAX/XLA compiled executables."""
+    configured = config.get("jax_cache_dir") if config else None
+    env_override = os.environ.get("JAX_COMPILATION_CACHE_DIR")
+    raw = (
+        configured
+        or env_override
+        or (Path.home() / ".cache" / "abcfold" / "jax_cache")
+    )
+    path = Path(str(raw)).expanduser()
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return path
+
+
+def jax_runtime_env(config: Optional[Mapping] = None) -> Dict[str, str]:
+    """AlphaFast-style JAX/XLA environment variables for fast AF3/IntelliFold runs."""
+    cache = jax_cache_dir(config)
+    xla_flags = os.environ.get("XLA_FLAGS", "").strip()
+    triton_flag = "--xla_gpu_enable_triton_gemm=false"
+    if triton_flag not in xla_flags:
+        xla_flags = f"{xla_flags} {triton_flag}".strip()
+    env = {
+        "JAX_COMPILATION_CACHE_DIR": str(cache),
+        "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "0",
+        "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "2",
+        "XLA_FLAGS": xla_flags,
+    }
+    if "XLA_CLIENT_MEM_FRACTION" not in os.environ:
+        env["XLA_CLIENT_MEM_FRACTION"] = "0.95"
+    return env
 
 
 class BackendEnvError(RuntimeError):
@@ -142,6 +187,10 @@ class MicromambaEnv:
         """Return True if command is on PATH inside the environment."""
         if self.is_current:
             return shutil.which(command) is not None
+        key = ("mamba", self.env_name, command)
+        with _CACHE_LOCK:
+            if key in _WHICH_CACHE:
+                return _WHICH_CACHE[key]
         code = "import shutil, sys; sys.exit(0 if shutil.which(sys.argv[1]) else 1)"
         try:
             subprocess.check_call(
@@ -150,9 +199,12 @@ class MicromambaEnv:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            return True
+            found = True
         except (subprocess.CalledProcessError, FileNotFoundError):
-            return False
+            found = False
+        with _CACHE_LOCK:
+            _WHICH_CACHE[key] = found
+        return found
 
     def env_exists(self) -> bool:
         if self.is_current:
@@ -294,6 +346,10 @@ class ContainerEnv:
 
     def which(self, command: str) -> bool:
         """Return True if command is on PATH inside the container."""
+        key = ("container", self.runner, self.image, command)
+        with _CACHE_LOCK:
+            if key in _WHICH_CACHE:
+                return _WHICH_CACHE[key]
         code = "import shutil, sys; sys.exit(0 if shutil.which(sys.argv[1]) else 1)"
         try:
             subprocess.check_call(
@@ -302,9 +358,12 @@ class ContainerEnv:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            return True
+            found = True
         except (subprocess.CalledProcessError, FileNotFoundError):
-            return False
+            found = False
+        with _CACHE_LOCK:
+            _WHICH_CACHE[key] = found
+        return found
 
     def env_exists(self) -> bool:
         if self.runner == "docker":
@@ -743,6 +802,11 @@ def build_env(
 
 def verify_env(spec: BackendEnvSpec, allow_mismatch: bool = False) -> str:
     """Check (never modify) a backend env. Returns the installed version."""
+    cache_key = ("mamba", spec.env, spec.package, spec.version, allow_mismatch)
+    with _CACHE_LOCK:
+        cached = _VERIFY_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     env = MicromambaEnv(spec.env)
     if not env.env_exists():
         raise BackendEnvError(
@@ -772,6 +836,8 @@ def verify_env(spec: BackendEnvSpec, allow_mismatch: bool = False) -> str:
                 f"Env '{spec.env}' contains {forbidden}, which shadows rdkit. "
                 f"Remove it: micromamba run -n {spec.env} pip uninstall -y {forbidden}"
             )
+    with _CACHE_LOCK:
+        _VERIFY_CACHE[cache_key] = installed
     return installed
 
 
@@ -781,7 +847,7 @@ def container_binds(settings) -> List[str]:
         "weights_dir", "boltz_weights", "openfold_weights",
         "rosettafold_weights", "intellifold_weights", "protenix_root_dir",
         "opendde_root_dir", "esmfold2_weights", "chai_downloads_dir",
-        "msa_cache_dir", "template_mirror_dir",
+        "msa_cache_dir", "template_mirror_dir", "jax_cache_dir",
     )
     binds = []
     for key in keys:

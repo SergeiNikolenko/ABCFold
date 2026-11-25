@@ -37,7 +37,11 @@ class Ipsae():
 
         # Read structure + PAE data
         if isinstance(self.input_model, CifFile):
-            self.struct = copy.deepcopy(self.input_model)
+            # Ipsae only mutates input_params on the wrapper, never the
+            # underlying BioPython Structure, so a shallow copy avoids copying
+            # thousands of Atom/Residue objects.
+            self.struct = copy.copy(self.input_model)
+            self.struct.input_params = {}
         else:
             self.struct = CifFile(self.input_model)
         self.process_input()

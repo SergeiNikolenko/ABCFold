@@ -285,8 +285,19 @@ def _write_device_manifests(
     diffusion_steps: int = 200,
 ) -> list[Path]:
     per_device: list[list[dict]] = [[] for _ in devices]
+    unique_cases: list[str] = []
+    for task in tasks:
+        cid = str(task.get("case_id", ""))
+        if cid and cid not in unique_cases:
+            unique_cases.append(cid)
+    case_to_idx = {cid: idx for idx, cid in enumerate(unique_cases)}
+    group_by_case = len(unique_cases) >= len(devices) and len(unique_cases) > 1
+
     for index, task in enumerate(tasks):
-        device_index = index % len(devices)
+        if group_by_case:
+            device_index = case_to_idx[str(task.get("case_id", ""))] % len(devices)
+        else:
+            device_index = index % len(devices)
         task = dict(task)
         task["device"] = devices[device_index]
         task["number_of_models"] = number_of_models

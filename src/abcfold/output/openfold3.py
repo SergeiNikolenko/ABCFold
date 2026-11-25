@@ -1,4 +1,5 @@
 import logging
+from concurrent.futures import ThreadPoolExecutor
 import re
 from pathlib import Path
 from typing import Optional, Union
@@ -199,21 +200,28 @@ class OpenfoldOutput:
         Returns:
             None
         """
+        def _convert(item):
+            seed, pae_file, cif_file = item
+            pae = Af3Pae.from_openfold3(pae_file.data, cif_file)
+            out_name = af3_pae_path(cif_file)
+            pae.to_file(out_name)
+            return seed, ConfidenceJsonFile(out_name, data=pae.scores)
+
+        tasks = [
+            (seed, pae_file, cif_file)
+            for seed in self.seeds
+            for pae_file, cif_file in zip(
+                self.pae_files[seed], self.cif_files[seed]
+            )
+        ]
         new_pae_files: dict[str, list[ConfidenceJsonFile]] = {}
-        for seed in self.seeds:
-            for (pae_file, cif_file) in zip(self.pae_files[seed], self.cif_files[seed]):
-                pae = Af3Pae.from_openfold3(
-                    pae_file.data,
-                    cif_file,
-                )
-
-                out_name = af3_pae_path(cif_file)
-
-                pae.to_file(out_name)
-
-                if seed not in new_pae_files:
-                    new_pae_files[seed] = []
-                new_pae_files[seed].append(ConfidenceJsonFile(out_name))
+        if len(tasks) > 1:
+            with ThreadPoolExecutor(max_workers=min(8, len(tasks))) as pool:
+                results = list(pool.map(_convert, tasks))
+        else:
+            results = [_convert(t) for t in tasks]
+        for seed, cjf in results:
+            new_pae_files.setdefault(seed, []).append(cjf)
 
         self.output = {
             seed: {

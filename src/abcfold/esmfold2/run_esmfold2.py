@@ -2,8 +2,10 @@ import json
 import logging
 import subprocess
 import tempfile
+import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional, Union
+from typing import Iterable, Optional, Tuple, Union
 
 from abcfold.esmfold2.af3_to_esmfold2 import Esmfold2json
 from abcfold.esmfold2.check_install import ensure_esmfold2_env
@@ -129,6 +131,110 @@ def run_esmfold2(
     logger.info("ESMFold2 run complete")
     logger.info("Output files are in %s", output_dir)
     return True
+
+
+def _gpu_slots(gpus: Optional[str]) -> list[Optional[str]]:
+    if gpus in (None, "all", "cpu"):
+        return [gpus]
+    slots: list[Optional[str]] = [
+        g.strip() for g in str(gpus).split(",") if g.strip()
+    ]
+    return slots or ["all"]
+
+
+def run_esmfold2_batch(
+    items: Iterable[Tuple[Union[str, Path], Union[str, Path]]],
+    config: dict,
+    save_input: bool = False,
+    test: bool = False,
+    number_of_models: int = 5,
+    gpus: Optional[str] = "all",
+) -> dict[Path, bool]:
+    """Fold many jobs loading the EsmFold2Model weights once per GPU."""
+    item_list = [(Path(inp), Path(out)) for inp, out in items]
+    if not item_list:
+        return {}
+    if test:
+        return {out: True for _, out in item_list}
+
+    env = ensure_esmfold2_env(config=config)
+    gpu_slots = _gpu_slots(gpus)
+    results: dict[Path, bool] = {out: False for _, out in item_list}
+
+    with tempfile.TemporaryDirectory(prefix="abcfold-esmfold2-batch-") as temp_dir:
+        work_root = Path(temp_dir)
+        runner_copy = work_root / "esmfold2_runner.py"
+        shutil.copyfile(RUNNER, runner_copy)
+
+        prepared_jobs = []
+        for idx, (inp, job_out) in enumerate(item_list):
+            job_out.mkdir(parents=True, exist_ok=True)
+            working_dir = (
+                input_dir_for(job_out, "esmfold2")
+                if save_input
+                else work_root / f"job_{idx}"
+            )
+            working_dir.mkdir(parents=True, exist_ok=True)
+            esmfold2_json = Esmfold2json(working_dir)
+            esmfold2_json.json_to_json(inp)
+            desc_file = working_dir / f"{inp.stem}_esmfold2.json"
+            esmfold2_json.write_json(desc_file)
+            esm_out = job_out / "esmfold2_results"
+            esm_out.mkdir(parents=True, exist_ok=True)
+            prepared_jobs.append((job_out, desc_file, esm_out))
+
+        base_options = {
+            "model_repo": config.get("esmfold2_model") or DEFAULT_ESMFOLD2_MODEL,
+            "device": config.get("esmfold2_device") or "cuda",
+            "num_loops": NUM_LOOPS,
+            "num_sampling_steps": NUM_SAMPLING_STEPS,
+            "num_diffusion_samples": number_of_models,
+        }
+
+        n_shards = min(len(gpu_slots), len(prepared_jobs))
+        shards: list[list[tuple[Path, Path, Path]]] = [[] for _ in range(n_shards)]
+        for idx, job_entry in enumerate(prepared_jobs):
+            shards[idx % n_shards].append(job_entry)
+
+        def _run_shard(shard_idx: int) -> None:
+            shard_jobs = shards[shard_idx]
+            manifest_path = work_root / f"manifest_{shard_idx}.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "options": base_options,
+                        "jobs": [
+                            {"description": str(desc), "output_dir": str(esm_out)}
+                            for _, desc, esm_out in shard_jobs
+                        ],
+                    },
+                    indent=2,
+                )
+            )
+            extra_env = cuda_env(gpu_slots[shard_idx])
+            weights = config.get("esmfold2_weights")
+            if weights:
+                extra_env["HF_HOME"] = str(Path(str(weights)).expanduser())
+            cmd = ["python", str(runner_copy), "--manifest", str(manifest_path)]
+            try:
+                env.run(cmd, extra_env=extra_env)
+            except subprocess.CalledProcessError as exc:
+                for job_out, _, _ in shard_jobs:
+                    if exc.stderr:
+                        (job_out / "esmfold2_error.log").write_text(exc.stderr)
+                return
+            for job_out, _, esm_out in shard_jobs:
+                results[job_out] = bool(list(esm_out.rglob("*_model.cif")))
+
+        if n_shards > 1:
+            with ThreadPoolExecutor(max_workers=n_shards) as pool:
+                futs = [pool.submit(_run_shard, i) for i in range(n_shards)]
+                for fut in as_completed(futs):
+                    fut.result()
+        else:
+            _run_shard(0)
+
+    return results
 
 
 def generate_esmfold2_command(

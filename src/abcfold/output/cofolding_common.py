@@ -195,7 +195,7 @@ class SeedSampleOutput:
                 pae.to_file(af3_pae_path)
                 entry: CollectedFiles = {
                     "cif": cif_file,
-                    "af3_pae": ConfidenceJsonFile(str(af3_pae_path)),
+                    "af3_pae": ConfidenceJsonFile(str(af3_pae_path), data=pae.scores),
                 }
                 if files.get("score") is not None:
                     entry["scores"] = files["score"]

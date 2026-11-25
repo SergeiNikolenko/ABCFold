@@ -507,6 +507,21 @@ Additionally, Boltz currently lack the ability to create linked-ligands and ther
 Currently OpenFold3 is unable to create bonded-pairs or alter the number of recycles. Therefore these options will be ignored if provided.
 
 
+## Performance & Multi-GPU Acceleration
+
+ABCFold applies AlphaFast-style pipeline optimizations across both single runs (`abcfold run`) and manifest batches (`abcfold batch`):
+
+- **Persistent GPU workers & single-process multi-seed**:
+  - **Boltz-2** (`run_boltz` and `run_boltz_batch`) runs a persistent worker (`boltz_worker.py`) that parses MSAs/ligands and loads `boltz2_conf.ckpt` once per GPU across all seeds and batch targets, with TF32 and automatic cuEquivariance kernel detection on Ampere+ GPUs. Physical steering potentials stay off by default and can be enabled with `--boltz_use_potentials`.
+  - **Protenix** runs all seeds in one `runner.inference` invocation (`--seeds s1,s2,...`) and combines batch jobs per GPU.
+  - **Chai-1** automatically disables `low_memory` CPU offloading on GPUs with >= 24 GiB VRAM, enables TF32, caches exported TorchScript modules across tasks, and reuses the ESM-2/MSA feature context across seeds of the same complex.
+  - **IntelliFold** and **AlphaFold 3** share a persistent JAX/XLA compilation cache (`jax_cache_dir` / `JAX_COMPILATION_CACHE_DIR`, default `~/.cache/abcfold/jax_cache`) and `XLA_FLAGS="--xla_gpu_enable_triton_gemm=false"`.
+  - **ESMFold2**, **OpenFold3**, and **OpenDDE** load checkpoints once per GPU across batched jobs (`--manifest` / merged queries), and ESMFold2 enables TF32, `torch.inference_mode()`, and auto-detects `mode="fused"` on `esm >= 3.5`.
+- **Multi-GPU & CPU/GPU overlap**:
+  - Passing multiple GPU IDs to `abcfold run` (e.g. `--gpus 0,1`) runs independent predictors concurrently across GPU slots and overlaps CPU output summarization with the next GPU stage.
+  - `abcfold batch` sorts pending jobs by estimated token length (longest-first for balanced multi-GPU makespan) and executes phase-separated batched GPU runs by default (deduplicated MSA prefetch -> batched GPU weights-loaded-once -> parallel CPU reporting). Pass `--no-batched` to fall back to one subprocess per job.
+- **Fast CPU post-processing**: compact PAE JSON output, zero-reread preloaded `ConfidenceJsonFile`, cached vectorized clash detection, parallel PAE conversion/scoring, and in-process PAE HTML rendering.
+
 ## Contributing
 
 Contributions are welcome! Please open an issue or submit a pull request.

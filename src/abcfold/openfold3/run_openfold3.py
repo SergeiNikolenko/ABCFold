@@ -1,8 +1,11 @@
+import json
 import logging
+import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional, Union
+from typing import Iterable, Optional, Tuple, Union
 
 from abcfold.gpus import to_physical
 from abcfold.openfold3.af3_to_openfold3 import OpenfoldJson
@@ -113,6 +116,146 @@ def run_openfold(
     logger.info("OpenFold 3 run complete")
     logger.info("Output files are in %s", output_dir)
     return True
+
+
+def _gpu_slot_list(gpus: str) -> list[str]:
+    if gpus in (None, "all", "cpu"):
+        return [gpus or "all"]
+    slots = [g.strip() for g in str(gpus).split(",") if g.strip()]
+    return slots or ["all"]
+
+
+def run_openfold_batch(
+    items: Iterable[Tuple[Union[str, Path], Union[str, Path]]],
+    config: dict,
+    save_input: bool = False,
+    test: bool = False,
+    number_of_models: int = 5,
+    input_ckpt: Optional[Union[str, Path]] = None,
+    num_recycles: Optional[int] = None,
+    diffusion_steps: Optional[int] = None,
+    fetch_templates: bool = False,
+    template_mirror_dir: Optional[Union[str, Path]] = None,
+    gpus: str = "all",
+) -> dict[Path, bool]:
+    """Run many OpenFold3 queries in one invocation per GPU (weights loaded once)."""
+    item_list = [(Path(inp), Path(out)) for inp, out in items]
+    if not item_list:
+        return {}
+    if test:
+        return {out: True for _, out in item_list}
+
+    env = ensure_openfold_env(config=config)
+    ckpt_path: Optional[Path] = None
+    if input_ckpt is not None:
+        ckpt_path = Path(input_ckpt)
+        if not ckpt_path.exists():
+            logger.error("OpenFold3 checkpoint not found: %s", ckpt_path)
+            return {out: False for _, out in item_list}
+    cache_dir = openfold_cache_dir(config)
+    ckpt_name = config.get("openfold_checkpoint")
+    if ckpt_path is None:
+        ensure_openfold_checkpoint(env, cache_dir, ckpt_name)
+
+    gpu_slots = _gpu_slot_list(gpus)
+    results: dict[Path, bool] = {out: False for _, out in item_list}
+
+    with tempfile.TemporaryDirectory(prefix="abcfold-openfold3-batch-") as temp_dir:
+        work_root = Path(temp_dir)
+        groups: dict[tuple[int, ...], list[tuple[Path, str, dict, OpenfoldJson]]] = {}
+        for idx, (inp, job_out) in enumerate(item_list):
+            job_out.mkdir(parents=True, exist_ok=True)
+            working_dir = job_out if save_input else work_root / f"job_{idx}"
+            working_dir.mkdir(parents=True, exist_ok=True)
+            oj = OpenfoldJson(working_dir)
+            oj.json_to_json(inp)
+            query_name = next(iter(oj.openfold_dict["queries"]))
+            seeds_key = tuple(int(s) for s in (oj.seeds or [42]))
+            groups.setdefault(seeds_key, []).append(
+                (job_out, query_name, oj.openfold_dict["queries"][query_name], oj)
+            )
+
+        def _run_shard(
+            shard_idx: int,
+            seeds_key: tuple[int, ...],
+            shard_items: list[tuple[Path, str, dict, OpenfoldJson]],
+            gpu_slot: str,
+        ) -> None:
+            shard_dir = work_root / f"shard_{shard_idx}"
+            shard_dir.mkdir(parents=True, exist_ok=True)
+            merged_queries = {}
+            for _, qname, qbody, _ in shard_items:
+                merged_queries[qname] = qbody
+            query_file = shard_dir / "queries.json"
+            query_file.write_text(
+                json.dumps(
+                    {"seeds": list(seeds_key), "queries": merged_queries}, indent=2
+                )
+            )
+            runner_yaml = shard_dir / "openfold3_runner.yml"
+            shard_items[0][3].write_yaml(
+                runner_yaml,
+                num_recycles=num_recycles,
+                diffusion_steps=diffusion_steps,
+                fetch_templates=fetch_templates,
+                template_mirror_dir=template_mirror_dir,
+                cache_dir=cache_dir,
+            )
+            batch_out = shard_dir / "openfold_results"
+            cmd = generate_openfold_command(
+                query_file,
+                batch_out,
+                runner_yaml,
+                ckpt_path,
+                number_of_models,
+                checkpoint_name=None if ckpt_path else ckpt_name,
+            )
+            extra_env = _gpu_env(gpu_slot) | {"OPENFOLD_CACHE": str(cache_dir)}
+            try:
+                env.run(cmd, extra_env=extra_env)
+            except subprocess.CalledProcessError as exc:
+                for job_out, _, _, _ in shard_items:
+                    _write_error(job_out, "openfold_error.log", exc)
+                return
+
+            for job_out, qname, _, _ in shard_items:
+                src = batch_out / qname
+                dst_root = job_out / "openfold_results"
+                dst = dst_root / qname
+                if src.exists() and list(src.rglob("*_model.cif")):
+                    if dst.exists():
+                        shutil.rmtree(dst)
+                    dst_root.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src), str(dst))
+                    results[job_out] = True
+
+        tasks = []
+        shard_counter = 0
+        for seeds_key, group_items in groups.items():
+            n_shards = min(len(gpu_slots), len(group_items))
+            shards: list[list[tuple[Path, str, dict, OpenfoldJson]]] = [
+                [] for _ in range(n_shards)
+            ]
+            for idx, item in enumerate(group_items):
+                shards[idx % n_shards].append(item)
+            for slot_idx, shard_items in enumerate(shards):
+                tasks.append(
+                    (shard_counter, seeds_key, shard_items, gpu_slots[slot_idx])
+                )
+                shard_counter += 1
+
+        if len(tasks) > 1 and len(gpu_slots) > 1:
+            with ThreadPoolExecutor(
+                max_workers=min(len(gpu_slots), len(tasks))
+            ) as pool:
+                futs = [pool.submit(_run_shard, *t) for t in tasks]
+                for fut in as_completed(futs):
+                    fut.result()
+        else:
+            for t in tasks:
+                _run_shard(*t)
+
+    return results
 
 
 def _gpu_env(gpus: str) -> dict:

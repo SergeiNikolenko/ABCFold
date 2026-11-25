@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+try:
+    from scipy.spatial import cKDTree as _ScipyKDTree
+except ImportError:  # pragma: no cover - optional dependency
+    _ScipyKDTree = None
 from Bio.PDB import MMCIFIO, MMCIFParser, Model
 from Bio.PDB.Chain import Chain
 from Bio.PDB.Atom import Atom
@@ -185,6 +189,7 @@ class CifFile(FileBase):
         self.__plddts: Optional[List[float]] = None
         self.__residue_plddts: Optional[List[float]] = None
         self.__h_score: Optional[float] = None
+        self._clash_cache: dict = {}
         self.__name: str = self.cif_file.stem
 
     @property
@@ -203,9 +208,12 @@ class CifFile(FileBase):
         """
         The pLDDT scores for each atom in the model
         """
-        self.__plddts = [
-            plddts for plddts in self.get_plddt_per_atom().values() for plddts in plddts
-        ]
+        if self.__plddts is None:
+            self.__plddts = [
+                plddts
+                for plddts in self.get_plddt_per_atom().values()
+                for plddts in plddts
+            ]
         return self.__plddts
 
     @property
@@ -213,12 +221,12 @@ class CifFile(FileBase):
         """
         The pLDDT scores for each residue in the model
         """
-
-        self.__residue_plddts = [
-            plddts
-            for plddts in self.get_plddt_per_residue().values()
-            for plddts in plddts
-        ]
+        if self.__residue_plddts is None:
+            self.__residue_plddts = [
+                plddts
+                for plddts in self.get_plddt_per_residue().values()
+                for plddts in plddts
+            ]
         return self.__residue_plddts
 
     @property
@@ -597,10 +605,19 @@ class CifFile(FileBase):
         assert old_chain_label_counter == len(
             self.get_chains()
         ), "Number of chain ids must match the number of chains"
+        self._invalidate_caches()
         if persist:
             self.update()
 
+    def _invalidate_caches(self) -> None:
+        self.__plddts = None
+        self.__residue_plddts = None
+        self.__ligand_plddts = None
+        self.__h_score = None
+        self._clash_cache = {}
+
     def update(self):
+        self._invalidate_caches()
         self.to_file(self.pathway)
         self = CifFile(self.pathway, self.input_params)
 
@@ -634,55 +651,96 @@ for reordering"
             A list of clashes.
 
         """
-        atoms = self.get_atoms()
-        coords = np.array(
-            [atom.get_coord() for atom in atoms],
-            dtype="d",
-        )
         assert bucket > 1
-        assert coords.shape[1] == 3
         assert clash_cutoff > 0.0 and clash_cutoff <= 1.0
 
-        tree = KDTree(coords, bucket)
-        neighbors = tree.neighbor_search(threshold)
-        clashes_atoms, clashes_residues = [], []
+        cache_key = (float(threshold), int(bucket), float(clash_cutoff))
+        cached = self._clash_cache.get(cache_key)
+        if cached is not None:
+            cached_atoms, cached_residues = cached
+            self.clashes = len(cached_atoms)
+            self.clashes_residues = len(cached_residues)
+            return cached
 
-        for neighbor in neighbors:
-            i1, i2 = neighbor.index1, neighbor.index2
-            atom1, atom2 = atoms[i1], atoms[i2]
-            # get the element of the atom
-            element1 = atom1.element
-            element2 = atom2.element
-            # find chain_id and residue_id
-            chain_id1 = atom1.get_full_id()[2]
-            chain_id2 = atom2.get_full_id()[2]
+        atoms: List[Atom] = []
+        chain_indices: List[int] = []
+        vdw_radii: List[float] = []
+        for c_idx, chain in enumerate(self.model[0]):
+            for atom in chain.get_atoms():
+                atoms.append(atom)
+                chain_indices.append(c_idx)
+                vdw_radii.append(VANDERWALLS.get(atom.element, 1.7))
 
-            if chain_id1 == chain_id2:
-                continue
+        if len(atoms) < 2:
+            self.clashes = 0
+            self.clashes_residues = 0
+            result: Tuple[List[Tuple[Atom, Atom]], List[Tuple[Residue, Residue]]] = (
+                [],
+                [],
+            )
+            self._clash_cache[cache_key] = result
+            return result
 
-            distance = np.linalg.norm(atom1.get_coord() - atom2.get_coord())
-            if (atom1.name == "C" and atom1.name == "N") or (
-                atom2.name == "N" and atom1.name == "C"
-            ):
-                continue
-            elif (atom1.name == "SG" and atom2.name == "SG") and distance > 1.88:
-                continue
+        coords = np.asarray([atom.get_coord() for atom in atoms], dtype=np.float64)
+        assert coords.shape[1] == 3
 
-            clash_radius = (
-                VANDERWALLS.get(element1, 1.7) + VANDERWALLS.get(element2, 1.7)
-            ) * 0.63
-            if distance < clash_radius:
+        if _ScipyKDTree is not None:
+            tree = _ScipyKDTree(coords, leafsize=bucket)
+            pairs = tree.query_pairs(r=float(threshold), output_type="ndarray")
+        else:
+            tree = KDTree(coords, bucket)
+            neighbors = tree.neighbor_search(threshold)
+            pairs = (
+                np.asarray(
+                    [(n.index1, n.index2) for n in neighbors], dtype=np.int32
+                )
+                if neighbors
+                else np.empty((0, 2), dtype=np.int32)
+            )
+
+        clashes_atoms: List[Tuple[Atom, Atom]] = []
+        clashes_residues: List[Tuple[Residue, Residue]] = []
+        seen_residues: set = set()
+
+        if len(pairs) > 0:
+            chain_arr = np.asarray(chain_indices, dtype=np.int32)
+            diff_chain = chain_arr[pairs[:, 0]] != chain_arr[pairs[:, 1]]
+            pairs = pairs[diff_chain]
+
+        if len(pairs) > 0:
+            i1_arr = pairs[:, 0]
+            i2_arr = pairs[:, 1]
+            deltas = coords[i1_arr] - coords[i2_arr]
+            dists = np.sqrt(np.einsum("ij,ij->i", deltas, deltas))
+            vdw_arr = np.asarray(vdw_radii, dtype=np.float64)
+            radii = (vdw_arr[i1_arr] + vdw_arr[i2_arr]) * clash_cutoff
+            hit_idx = np.flatnonzero(dists < radii)
+
+            for k in hit_idx:
+                atom1 = atoms[int(i1_arr[k])]
+                atom2 = atoms[int(i2_arr[k])]
+                distance = float(dists[k])
+                if (atom1.name == "C" and atom2.name == "N") or (
+                    atom1.name == "N" and atom2.name == "C"
+                ):
+                    continue
+                if atom1.name == "SG" and atom2.name == "SG" and distance > 1.88:
+                    continue
+
                 residue1 = atom1.get_parent()
                 residue2 = atom2.get_parent()
-
                 clashes_atoms.append((atom1, atom2))
-
-                if (residue1, residue2) not in clashes_residues:
-                    clashes_residues.append((residue1, residue2))
+                if residue1 is not None and residue2 is not None:
+                    res_pair = (residue1, residue2)
+                    if res_pair not in seen_residues:
+                        seen_residues.add(res_pair)
+                        clashes_residues.append(res_pair)
 
         self.clashes = len(clashes_atoms)
         self.clashes_residues = len(clashes_residues)
-        return (clashes_atoms, clashes_residues)
+        result = (clashes_atoms, clashes_residues)
+        self._clash_cache[cache_key] = result
+        return result
 
     def get_atoms(self, chain_id=None) -> list:
         """
@@ -871,12 +929,16 @@ for reordering"
 
 
 class ConfidenceJsonFile(FileBase):
-    def __init__(self, json_file: Union[str, Path]):
+    def __init__(
+        self, json_file: Union[str, Path], data: Optional[dict] = None
+    ):
         """
         Object to handle json files
 
         Args:
             json_file (Union[str, Path]): Path to the json file
+            data (Optional[dict]): Preloaded JSON dictionary to avoid a
+                redundant disk read when the caller already built it in memory.
 
         Attributes:
             json_file (Path): Path to the json file
@@ -884,7 +946,17 @@ class ConfidenceJsonFile(FileBase):
 
         """
         super().__init__(json_file)
-        self.data = self.load_json_file()
+        self._data = data
+
+    @property
+    def data(self):
+        if self._data is None:
+            self._data = self.load_json_file()
+        return self._data
+
+    @data.setter
+    def data(self, value):
+        self._data = value
 
     def load_json_file(self):
         # load the json file

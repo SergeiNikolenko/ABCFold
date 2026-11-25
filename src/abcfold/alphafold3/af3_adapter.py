@@ -34,6 +34,7 @@ CONTAINER_OUTPUT_DIR = "/root/af_output"
 CONTAINER_MODEL_DIR = "/root/models"
 CONTAINER_DB_DIR = "/root/public_databases"
 CONTAINER_APP_DIR = "/app/alphafold"
+CONTAINER_JAX_CACHE_DIR = "/root/jax_cache"
 
 
 def sanitised_name(name: str) -> str:
@@ -57,6 +58,7 @@ class Af3Config:
     num_recycles: Optional[int] = None
     num_seeds: Optional[int] = None
     save_distogram: bool = False
+    jax_compilation_cache_dir: Optional[str] = None
     extra_flags: List[str] = field(default_factory=list)
 
     @classmethod
@@ -74,6 +76,7 @@ class Af3Config:
             append_flags=str(pick("af3_append_flags", True)).lower()
             not in ("false", "0", "no"),
             run_script=str(pick("af3_run_script", "run_alphafold.py")),
+            jax_compilation_cache_dir=pick("jax_cache_dir"),
         )
         for key, value in overrides.items():
             if value is not None:
@@ -92,6 +95,7 @@ def af3_flags(
     output_dir: Optional[str] = None,
     model_dir: Optional[str] = None,
     db_dir: Optional[str] = None,
+    jax_cache_dir: Optional[str] = None,
 ) -> List[str]:
     """Flags for ``run_alphafold.py``; path flags only when paths are given."""
     if mode not in MODES:
@@ -117,6 +121,8 @@ def af3_flags(
             flags.append(f"--num_seeds={int(cfg.num_seeds)}")
         if cfg.save_distogram:
             flags.append("--save_distogram=true")
+        if jax_cache_dir:
+            flags.append(f"--jax_compilation_cache_dir={jax_cache_dir}")
     flags.extend(cfg.extra_flags)
     return flags
 
@@ -174,6 +180,12 @@ def build_af3_command(
     if needs_dbs:
         mounts.append((str(Path(str(cfg.db_dir)).expanduser().resolve()),
                        CONTAINER_DB_DIR, True))
+    jax_cache_container: Optional[str] = None
+    if needs_models and cfg.jax_compilation_cache_dir:
+        host_jax = Path(str(cfg.jax_compilation_cache_dir)).expanduser().resolve()
+        host_jax.mkdir(parents=True, exist_ok=True)
+        mounts.append((str(host_jax), CONTAINER_JAX_CACHE_DIR, False))
+        jax_cache_container = CONTAINER_JAX_CACHE_DIR
 
     flags = af3_flags(
         cfg,
@@ -182,6 +194,7 @@ def build_af3_command(
         output_dir=CONTAINER_OUTPUT_DIR,
         model_dir=CONTAINER_MODEL_DIR if needs_models else None,
         db_dir=CONTAINER_DB_DIR if needs_dbs else None,
+        jax_cache_dir=jax_cache_container,
     )
 
     if cfg.runner == "docker":
@@ -219,6 +232,29 @@ def af3_subprocess_env(cfg: Af3Config, environ: Optional[Mapping] = None) -> Dic
         env["CUDA_VISIBLE_DEVICES"] = physical
         env["APPTAINERENV_CUDA_VISIBLE_DEVICES"] = physical
         env["SINGULARITYENV_CUDA_VISIBLE_DEVICES"] = physical
+    env.setdefault("XLA_FLAGS", "--xla_gpu_enable_triton_gemm=false")
+    env.setdefault("XLA_CLIENT_MEM_FRACTION", "0.95")
+    env.setdefault("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "0")
+    env.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "2")
+    if cfg.jax_compilation_cache_dir:
+        host_jax = str(Path(str(cfg.jax_compilation_cache_dir)).expanduser())
+        env.setdefault("JAX_COMPILATION_CACHE_DIR", host_jax)
+    if cfg.runner in ("apptainer", "singularity"):
+        env.setdefault("APPTAINERENV_XLA_FLAGS", env["XLA_FLAGS"])
+        env.setdefault("SINGULARITYENV_XLA_FLAGS", env["XLA_FLAGS"])
+        env.setdefault(
+            "APPTAINERENV_XLA_CLIENT_MEM_FRACTION", env["XLA_CLIENT_MEM_FRACTION"]
+        )
+        env.setdefault(
+            "SINGULARITYENV_XLA_CLIENT_MEM_FRACTION", env["XLA_CLIENT_MEM_FRACTION"]
+        )
+        if cfg.jax_compilation_cache_dir:
+            env.setdefault(
+                "APPTAINERENV_JAX_COMPILATION_CACHE_DIR", CONTAINER_JAX_CACHE_DIR
+            )
+            env.setdefault(
+                "SINGULARITYENV_JAX_COMPILATION_CACHE_DIR", CONTAINER_JAX_CACHE_DIR
+            )
     return env
 
 
