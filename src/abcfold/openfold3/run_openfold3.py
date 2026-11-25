@@ -7,7 +7,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, Optional, Tuple, Union
 
-from abcfold.gpus import to_physical
+from abcfold.gpus import (detect_gpu_slots, fast_torch_env, plan_gpu_workers,
+                          resolve_openfold_low_mem, to_physical)
 from abcfold.openfold3.af3_to_openfold3 import OpenfoldJson
 from abcfold.openfold3.check_install import (ensure_openfold_checkpoint,
                                              ensure_openfold_env,
@@ -74,6 +75,16 @@ def run_openfold(
         out_file = working_dir.joinpath(f"{input_json.stem}.json")
         openfold_json.write_json(out_file)
 
+        seeds = [int(s) for s in openfold_json.seeds] or [42]
+        gpu_slots = detect_gpu_slots(gpus)
+        shard_seeds = (
+            not test
+            and len(seeds) > 1
+            and len(gpu_slots) > 1
+            and gpu_slots != ["cpu"]
+            and gpu_slots != ["all"]
+        )
+        low_mem = resolve_openfold_low_mem(gpus)
         runner_yaml = working_dir / "openfold3_runner.yml"
         openfold_json.write_yaml(
             runner_yaml,
@@ -82,6 +93,7 @@ def run_openfold(
             fetch_templates=fetch_templates,
             template_mirror_dir=template_mirror_dir,
             cache_dir=cache_dir,
+            low_mem=low_mem,
         )
 
         logger.info("Running OpenFold 3 using seeds: %s", openfold_json.seeds)
@@ -99,13 +111,76 @@ def run_openfold(
             else generate_openfold_test_command()
         )
         if not test:
-            extra_env = _gpu_env(gpus) | {"OPENFOLD_CACHE": str(cache_dir)}
-            try:
+            if not shard_seeds:
+                extra_env = (
+                    fast_torch_env()
+                    | _gpu_env(gpus)
+                    | {"OPENFOLD_CACHE": str(cache_dir)}
+                )
+                try:
+                    assert env is not None
+                    env.run(cmd, extra_env=extra_env)
+                except subprocess.CalledProcessError as e:
+                    _write_error(output_dir, "openfold_error.log", e)
+                    return False
+            else:
                 assert env is not None
-                env.run(cmd, extra_env=extra_env)
-            except subprocess.CalledProcessError as e:
-                _write_error(output_dir, "openfold_error.log", e)
-                return False
+                n_shards = min(len(gpu_slots), len(seeds))
+                shards: list[list[int]] = [[] for _ in range(n_shards)]
+                for idx, s in enumerate(seeds):
+                    shards[idx % n_shards].append(s)
+
+                def _run_seed_shard(shard_idx: int) -> bool:
+                    s_seeds = shards[shard_idx]
+                    s_yaml = working_dir / f"openfold3_runner_shard{shard_idx}.yml"
+                    s_oj = OpenfoldJson(working_dir, create_files=False)
+                    s_oj.seeds = s_seeds
+                    s_oj.templates = openfold_json.templates
+                    s_oj._use_templates = openfold_json._use_templates
+                    s_oj.write_yaml(
+                        s_yaml,
+                        num_recycles=num_recycles,
+                        diffusion_steps=diffusion_steps,
+                        fetch_templates=fetch_templates,
+                        template_mirror_dir=template_mirror_dir,
+                        cache_dir=cache_dir,
+                        low_mem=resolve_openfold_low_mem(gpu_slots[shard_idx]),
+                    )
+                    s_yaml.write_text(
+                        s_oj.write_yaml(
+                            s_yaml,
+                            num_recycles=num_recycles,
+                            diffusion_steps=diffusion_steps,
+                            fetch_templates=fetch_templates,
+                            template_mirror_dir=template_mirror_dir,
+                            cache_dir=cache_dir,
+                            low_mem=resolve_openfold_low_mem(gpu_slots[shard_idx]),
+                        )
+                    )
+                    s_cmd = generate_openfold_command(
+                        out_file,
+                        openfold_out_dir,
+                        s_yaml,
+                        ckpt_path,
+                        number_of_models,
+                        checkpoint_name=None if ckpt_path else ckpt_name,
+                    )
+                    s_env = (
+                        fast_torch_env()
+                        | _gpu_env(gpu_slots[shard_idx])
+                        | {"OPENFOLD_CACHE": str(cache_dir)}
+                    )
+                    try:
+                        env.run(s_cmd, extra_env=s_env)
+                    except subprocess.CalledProcessError as e:
+                        _write_error(output_dir, "openfold_error.log", e)
+                        return False
+                    return True
+
+                with ThreadPoolExecutor(max_workers=n_shards) as pool:
+                    futs = [pool.submit(_run_seed_shard, i) for i in range(n_shards)]
+                    if not all(f.result() for f in as_completed(futs)):
+                        return False
 
             if not list(openfold_out_dir.rglob("*_model.cif")):
                 logger.error(
@@ -119,10 +194,7 @@ def run_openfold(
 
 
 def _gpu_slot_list(gpus: str) -> list[str]:
-    if gpus in (None, "all", "cpu"):
-        return [gpus or "all"]
-    slots = [g.strip() for g in str(gpus).split(",") if g.strip()]
-    return slots or ["all"]
+    return detect_gpu_slots(gpus)
 
 
 def run_openfold_batch(
@@ -137,6 +209,7 @@ def run_openfold_batch(
     fetch_templates: bool = False,
     template_mirror_dir: Optional[Union[str, Path]] = None,
     gpus: str = "all",
+    workers_per_gpu: Optional[int] = None,
 ) -> dict[Path, bool]:
     """Run many OpenFold3 queries in one invocation per GPU (weights loaded once)."""
     item_list = [(Path(inp), Path(out)) for inp, out in items]
@@ -157,15 +230,22 @@ def run_openfold_batch(
     if ckpt_path is None:
         ensure_openfold_checkpoint(env, cache_dir, ckpt_name)
 
-    gpu_slots = _gpu_slot_list(gpus)
+    gpu_slots = plan_gpu_workers(
+        gpus,
+        len(item_list),
+        engine="openfold3",
+        workers_per_gpu=workers_per_gpu,
+    )
     results: dict[Path, bool] = {out: False for _, out in item_list}
 
     with tempfile.TemporaryDirectory(prefix="abcfold-openfold3-batch-") as temp_dir:
         work_root = Path(temp_dir)
+        shared_msa_dir = work_root / "msas"
+        shared_msa_dir.mkdir(parents=True, exist_ok=True)
         groups: dict[tuple[int, ...], list[tuple[Path, str, dict, OpenfoldJson]]] = {}
         for idx, (inp, job_out) in enumerate(item_list):
             job_out.mkdir(parents=True, exist_ok=True)
-            working_dir = job_out if save_input else work_root / f"job_{idx}"
+            working_dir = job_out if save_input else shared_msa_dir
             working_dir.mkdir(parents=True, exist_ok=True)
             oj = OpenfoldJson(working_dir)
             oj.json_to_json(inp)
@@ -200,6 +280,7 @@ def run_openfold_batch(
                 fetch_templates=fetch_templates,
                 template_mirror_dir=template_mirror_dir,
                 cache_dir=cache_dir,
+                low_mem=resolve_openfold_low_mem(gpu_slot),
             )
             batch_out = shard_dir / "openfold_results"
             cmd = generate_openfold_command(
@@ -210,7 +291,11 @@ def run_openfold_batch(
                 number_of_models,
                 checkpoint_name=None if ckpt_path else ckpt_name,
             )
-            extra_env = _gpu_env(gpu_slot) | {"OPENFOLD_CACHE": str(cache_dir)}
+            extra_env = (
+                fast_torch_env()
+                | _gpu_env(gpu_slot)
+                | {"OPENFOLD_CACHE": str(cache_dir)}
+            )
             try:
                 env.run(cmd, extra_env=extra_env)
             except subprocess.CalledProcessError as exc:

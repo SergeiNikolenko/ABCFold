@@ -76,13 +76,11 @@ class Af3Pae:
                     order_mapping[i] = i
 
             # Reorder the PAE matrix rows and columns based on the mapping
-            reordered_matrix = np.zeros_like(pae_matrix)
-            for i in range(len(pae_matrix)):
-                for j in range(len(pae_matrix)):
-
-                    reordered_matrix[order_mapping[i], order_mapping[j]] = pae_matrix[
-                        i, j
-                    ]
+            n = len(pae_matrix)
+            inv = np.empty(n, dtype=np.intp)
+            for src_idx, dst_idx in order_mapping.items():
+                inv[dst_idx] = src_idx
+            reordered_matrix = pae_matrix[np.ix_(inv, inv)]
 
             return reordered_matrix.tolist()
 

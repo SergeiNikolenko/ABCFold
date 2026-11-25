@@ -7,7 +7,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, Union
 
-from abcfold.gpus import to_physical
+from abcfold.gpus import (detect_gpu_slots, fast_torch_env, plan_gpu_workers,
+                          to_physical)
 from abcfold.boltz.af3_to_boltz import BoltzYaml
 from abcfold.boltz.check_install import ensure_boltz_env
 from abcfold.boltz.crystal_modes import apply_crystal_mode
@@ -57,7 +58,11 @@ def _apply_cuda_visible_devices(cmd: list[str], cuda_devices: str | None) -> lis
 
 def _run_command(env, cmd: list[str], output_dir: Path) -> str | None:
     try:
-        stdout = env.run(cmd, capture_output=True)
+        extra_env = fast_torch_env()
+        try:
+            stdout = env.run(cmd, capture_output=True, extra_env=extra_env)
+        except TypeError:
+            stdout = env.run(cmd, capture_output=True)
         if stdout and "WARNING: ran out of memory" in stdout:
             logger.error("Boltz ran out of memory")
             return None
@@ -137,10 +142,31 @@ def _link_or_copy_input(input_json: Path, output_dir: Path) -> None:
 def _batch_gpu_slots(gpus: str) -> list[str | None]:
     cuda_devices = normalize_gpus(gpus)
     if cuda_devices is None:
-        return [None]
+        detected = detect_gpu_slots(gpus)
+        if detected == ["cpu"]:
+            return [""]
+        if detected == ["all"]:
+            return [None]
+        return list(detected)
     if cuda_devices == "":
         return [""]
     return list(cuda_devices.split(","))
+
+
+def _estimate_params_tokens(params: dict) -> int:
+    total = 0
+    for entry in params.get("sequences", []):
+        if not isinstance(entry, dict):
+            continue
+        for key in ("protein", "rna", "dna"):
+            if key in entry:
+                seq = entry[key].get("sequence") or ""
+                ids = entry[key].get("id")
+                copies = len(ids) if isinstance(ids, list) else 1
+                total += len(seq) * max(1, copies)
+        if "ligand" in entry:
+            total += 25
+    return max(1, total)
 
 
 def _seed_gpu(gpu_slots: list[str | None], index: int) -> str | None:
@@ -319,6 +345,7 @@ def run_boltz_batch(
     parallel_seeds: bool = True,
     sampling_steps: int = 200,
     boltz_use_potentials: bool = False,
+    workers_per_gpu: int | None = None,
 ) -> bool:
     """
     Run Boltz over many AlphaFold3 JSON files using one Boltz invocation per seed.
@@ -382,12 +409,6 @@ def run_boltz_batch(
         logger.info("Skipping Boltz batch backend execution in test mode")
         return True
 
-    try:
-        gpu_slots = _batch_gpu_slots(gpus)
-    except ValueError as e:
-        logger.error("Invalid GPU configuration: %s", e)
-        return False
-
     prepared: list[tuple[Path, dict, list[int]]] = []
     all_seeds_set: set[int] = set()
     for input_json in input_paths:
@@ -424,6 +445,25 @@ def run_boltz_batch(
         seed_out.parent.mkdir(parents=True, exist_ok=True)
 
     try:
+        normalize_gpus(gpus)
+        max_tokens = max(
+            (_estimate_params_tokens(p) for _, p, _ in prepared), default=300
+        )
+        planned = plan_gpu_workers(
+            gpus,
+            len(prepared),
+            engine="boltz",
+            est_tokens=max_tokens,
+            workers_per_gpu=workers_per_gpu,
+        )
+        gpu_slots: list[str | None] = [
+            "" if s == "cpu" else (None if s == "all" else s) for s in planned
+        ]
+    except ValueError as e:
+        logger.error("Invalid GPU configuration: %s", e)
+        return False
+
+    try:
         if len(gpu_slots) > 1 and len(prepared) > 1 and (
             not parallel_seeds or len(all_seeds) == 1 or len(prepared) >= len(gpu_slots)
         ):
@@ -432,22 +472,26 @@ def run_boltz_batch(
             ]
             for idx, item in enumerate(prepared):
                 shards[idx % len(shards)].append(item)
+            shared_msas_dir = batch_root / "msas"
+            shared_msas_dir.mkdir(parents=True, exist_ok=True)
+            # Pre-write unique content-hashed MSAs once before launching shards.
+            pre_yamls: dict[Path, str] = {}
+            for input_json, input_params, _ in prepared:
+                boltz_yaml = BoltzYaml(
+                    shared_msas_dir, template_threshold=inline_threshold
+                )
+                boltz_yaml.json_to_yaml(input_params)
+                pre_yamls[input_json] = boltz_yaml.yaml_string
 
             def _run_input_shard(shard_idx: int) -> bool:
                 shard_items = shards[shard_idx]
                 shard_dir = batch_root / f"_shard_{shard_idx}"
                 inputs_dir = shard_dir / "inputs"
-                msas_dir = shard_dir / "msas"
                 inputs_dir.mkdir(parents=True, exist_ok=True)
-                msas_dir.mkdir(parents=True, exist_ok=True)
                 shard_seed_records: dict[int, list[str]] = {}
                 for input_json, input_params, seeds_list in shard_items:
-                    boltz_yaml = BoltzYaml(
-                        msas_dir, template_threshold=inline_threshold
-                    )
-                    boltz_yaml.json_to_yaml(input_params)
                     yaml_out = inputs_dir / f"{input_json.stem}.yaml"
-                    boltz_yaml.write_yaml(yaml_out)
+                    yaml_out.write_text(pre_yamls[input_json])
                     for seed in seeds_list:
                         shard_seed_records.setdefault(seed, []).append(input_json.stem)
                 shard_seeds = sorted(shard_seed_records)

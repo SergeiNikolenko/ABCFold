@@ -1,9 +1,13 @@
 import logging
+import queue
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Union
+from typing import Iterable, Optional, Tuple, Union
 
+from abcfold.gpus import (cuda_env, detect_gpu_slots, fast_torch_env,
+                          plan_gpu_workers)
 from abcfold.rosettafold3.af3_to_rosettafold3 import Rosettafoldjson
 from abcfold.rosettafold3.check_install import (CHECKPOINT_NAME,
                                                 ensure_rosettafold_checkpoint,
@@ -19,6 +23,7 @@ def run_rosettafold(
     save_input: bool = False,
     test: bool = False,
     number_of_models: int = 5,
+    gpus: Optional[str] = "all",
 ) -> bool:
     """
     Run RosettaFold3 using the input JSON file
@@ -73,9 +78,11 @@ def run_rosettafold(
         rosettafold_json = Rosettafoldjson(working_dir)
         rosettafold_json.json_to_json(input_json)
 
-        for seed in rosettafold_json.seeds:
-            out_file = working_dir.joinpath(f"{input_json.stem}_seed-{seed}.json")
+        seeds = list(rosettafold_json.seeds)
+        gpu_slots = detect_gpu_slots(gpus)
 
+        def _run_seed(seed: int, slot: Optional[str]) -> bool:
+            out_file = working_dir.joinpath(f"{input_json.stem}_seed-{seed}.json")
             rosettafold_json.write_json(out_file)
             logger.info("Running RosettaFold3 using seed: %s", seed)
             rosettafold_out_dir = output_dir / f"rosettafold_results_seed-{seed}"
@@ -86,13 +93,15 @@ def run_rosettafold(
                 number_of_models,
                 seed,
             )
-
             if test:
-                continue
-
+                return True
+            extra_env = {**fast_torch_env(), **cuda_env(slot)}
             try:
                 assert env is not None
-                env.run(cmd)
+                try:
+                    env.run(cmd, extra_env=extra_env)
+                except TypeError:
+                    env.run(cmd)
             except subprocess.CalledProcessError as e:
                 stderr = e.stderr or ""
                 if stderr:
@@ -107,10 +116,93 @@ def run_rosettafold(
                 else:
                     logger.error("RosettaFold3 run failed")
                 return False
+            return True
+
+        if (
+            not test
+            and len(seeds) > 1
+            and len(gpu_slots) > 1
+            and gpu_slots != ["cpu"]
+            and gpu_slots != ["all"]
+        ):
+            slot_q: "queue.Queue[str]" = queue.Queue()
+            for s in gpu_slots:
+                slot_q.put(s)
+
+            def _worker(seed: int) -> bool:
+                slot = slot_q.get()
+                try:
+                    return _run_seed(seed, slot)
+                finally:
+                    slot_q.put(slot)
+
+            n_w = min(len(gpu_slots), len(seeds))
+            with ThreadPoolExecutor(max_workers=n_w) as pool:
+                futs = [pool.submit(_worker, s) for s in seeds]
+                if not all(f.result() for f in as_completed(futs)):
+                    return False
+        else:
+            for seed in seeds:
+                if not _run_seed(seed, gpus):
+                    return False
 
     logger.info("RosettaFold3 run complete")
     logger.info("Output files are in %s", output_dir)
     return True
+
+
+def run_rosettafold_batch(
+    items: Iterable[Tuple[Union[str, Path], Union[str, Path]]],
+    config: dict,
+    save_input: bool = False,
+    test: bool = False,
+    number_of_models: int = 5,
+    gpus: Optional[str] = "all",
+    workers_per_gpu: Optional[int] = None,
+) -> dict[Path, bool]:
+    """Run many RosettaFold3 jobs in parallel across all visible GPUs."""
+    item_list = [(Path(inp), Path(out)) for inp, out in items]
+    if not item_list:
+        return {}
+    if test:
+        return {out: True for _, out in item_list}
+
+    gpu_slots = plan_gpu_workers(
+        gpus,
+        len(item_list),
+        engine="rosettafold3",
+        workers_per_gpu=workers_per_gpu,
+    )
+    slot_q: "queue.Queue[str]" = queue.Queue()
+    for s in gpu_slots:
+        slot_q.put(s)
+    results: dict[Path, bool] = {out: False for _, out in item_list}
+
+    def _run_one(inp: Path, job_out: Path) -> None:
+        slot = slot_q.get()
+        try:
+            results[job_out] = run_rosettafold(
+                input_json=inp,
+                output_dir=job_out,
+                config=config,
+                save_input=save_input,
+                test=False,
+                number_of_models=number_of_models,
+                gpus=slot,
+            )
+        finally:
+            slot_q.put(slot)
+
+    n_workers = min(len(gpu_slots), len(item_list))
+    if n_workers > 1:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futs = [pool.submit(_run_one, inp, out) for inp, out in item_list]
+            for fut in as_completed(futs):
+                fut.result()
+    else:
+        for inp, out in item_list:
+            _run_one(inp, out)
+    return results
 
 
 def generate_rosettafold_command(

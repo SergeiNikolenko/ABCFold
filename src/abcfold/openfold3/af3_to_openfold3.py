@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import uuid
@@ -39,8 +40,10 @@ class OpenfoldJson:
         Returns:
             None
         """
-
-        with open(file_path, "w") as f:
+        out_path = Path(file_path)
+        if out_path.exists() and out_path.stat().st_size > 0:
+            return
+        with open(out_path, "w") as f:
             f.write(msa)
 
     def _write_template_cifs(self, templates: list) -> list:
@@ -148,7 +151,10 @@ class OpenfoldJson:
 
         unpaired_msa = seq_dict.get("unpairedMsa")
         paired_msa = seq_dict.get("pairedMsa")
-        msa_dir = Path(self.working_dir) / uuid.uuid4().hex
+        msa_digest = hashlib.sha256(
+            f"{unpaired_msa or ''}\0{paired_msa or ''}".encode()
+        ).hexdigest()[:16]
+        msa_dir = Path(self.working_dir) / f"msa_{msa_digest}"
         if unpaired_msa:
             msa_out = msa_dir / "colabfold_main.a3m"
             if self.__create_files:
@@ -247,6 +253,7 @@ class OpenfoldJson:
         fetch_templates: bool = False,
         template_mirror_dir: Optional[Union[str, Path]] = None,
         cache_dir: Optional[Union[str, Path]] = None,
+        low_mem: bool = True,
     ) -> str:
         """
         Write the OpenFold 3 runner yaml file.
@@ -271,7 +278,7 @@ class OpenfoldJson:
             "model_update:",
             "  presets:",
             "    - predict",
-            "    - low_mem",
+            *(["    - low_mem"] if low_mem else []),
             "  custom:",
             "    settings:",
             "      memory:",

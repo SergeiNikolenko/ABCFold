@@ -715,3 +715,381 @@ def test_chai_inference_caches_and_case_local_sharding(monkeypatch, tmp_path):
     c_b = fake_chai1.make_all_atom_feature_context(f1, msa_directory=tmp_path)
     assert c_a is c_b
     assert len(ctx_calls) == 1
+
+
+def test_gpu_auto_discovery_and_vram_packing(monkeypatch):
+    import abcfold.gpus as gpus_mod
+
+    gpus_mod.clear_gpu_cache()
+    # Simulate 2x 80 GiB idle GPUs and 1 busy GPU
+    fake_rows = [("0", 81920, 79000), ("1", 81920, 80500), ("2", 40960, 12000)]
+    monkeypatch.setattr(gpus_mod, "_query_raw_nvidia_smi", lambda: list(fake_rows))
+
+    assert gpus_mod.detect_gpu_slots("all", environ={}) == ["0", "1", "2"]
+    assert gpus_mod.detect_gpu_slots(
+        "all", environ={"CUDA_VISIBLE_DEVICES": "2,0"}
+    ) == [
+        "0",
+        "1",
+    ]
+    assert gpus_mod.detect_gpu_slots("cpu", environ={}) == ["cpu"]
+    assert gpus_mod.gpu_vram_mib("0,1", environ={}) == 81920
+    assert gpus_mod.resolve_openfold_low_mem("0", environ={}) is False
+
+    # Small 16 GiB GPU keeps low_mem=True
+    monkeypatch.setattr(
+        gpus_mod, "_query_raw_nvidia_smi", lambda: [("0", 16384, 15000)]
+    )
+    assert gpus_mod.resolve_openfold_low_mem("0", environ={}) is True
+
+    # 2x 80 GiB GPUs with 12 small Boltz ligands pack up to 3 workers/GPU
+    monkeypatch.setattr(
+        gpus_mod,
+        "_query_raw_nvidia_smi",
+        lambda: [("0", 81920, 79000), ("1", 81920, 80500)],
+    )
+    planned = gpus_mod.plan_gpu_workers(
+        "all", 12, engine="boltz", est_tokens=250, environ={}
+    )
+    assert len(planned) == 6
+    # Distinct GPUs filled first (emptiest GPU "1" before "0")
+    assert planned[:2] == ["1", "0"]
+    # JAX engine stays strictly 1 worker/GPU
+    jax_planned = gpus_mod.plan_gpu_workers(
+        "all", 12, engine="alphafold3", est_tokens=250, environ={}
+    )
+    assert jax_planned == ["1", "0"]
+    # Env opt-out forces 1 worker/GPU
+    no_pack = gpus_mod.plan_gpu_workers(
+        "all",
+        12,
+        engine="boltz",
+        est_tokens=250,
+        environ={"ABCFOLD_WORKERS_PER_GPU": "1"},
+    )
+    assert no_pack == ["1", "0"]
+
+    env_defaults = gpus_mod.fast_torch_env({})
+    assert env_defaults["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
+    assert "PYTORCH_CUDA_ALLOC_CONF" not in gpus_mod.fast_torch_env(
+        {"PYTORCH_CUDA_ALLOC_CONF": "max_split_size_mb:128"}
+    )
+
+
+def test_content_hashed_msa_deduplication_across_converters(tmp_path):
+    from abcfold.boltz.af3_to_boltz import BoltzYaml
+    from abcfold.esmfold2.af3_to_esmfold2 import Esmfold2json
+    from abcfold.opendde.af3_to_opendde import OpenDDEjson
+    from abcfold.openfold3.af3_to_openfold3 import OpenfoldJson
+    from abcfold.protenix.af3_to_protenix import ProtenixJson
+
+    a3m = ">q\nGMRES\n>h1\nGMRES\n"
+    p1 = {
+        "name": "lig1",
+        "modelSeeds": [1],
+        "sequences": [
+            {"protein": {"id": "A", "sequence": "GMRES", "unpairedMsa": a3m}},
+            {"ligand": {"id": "B", "smiles": "CCO"}},
+        ],
+    }
+    p2 = {
+        "name": "lig2",
+        "modelSeeds": [1],
+        "sequences": [
+            {"protein": {"id": "A", "sequence": "GMRES", "unpairedMsa": a3m}},
+            {"ligand": {"id": "B", "smiles": "CCC"}},
+        ],
+    }
+
+    # Boltz writes one shared content-hashed .a3m for both ligands
+    b_dir = tmp_path / "boltz"
+    b_dir.mkdir()
+    b1, b2 = BoltzYaml(b_dir), BoltzYaml(b_dir)
+    b1.json_to_yaml(p1)
+    b2.json_to_yaml(p2)
+    assert len(list(b_dir.glob("*.a3m"))) == 1
+
+    # Protenix shares one msa_<hash>/non_pairing.a3m
+    pr_dir = tmp_path / "protenix"
+    pr_dir.mkdir()
+    d1 = ProtenixJson(pr_dir).json_to_json(p1)
+    d2 = ProtenixJson(pr_dir).json_to_json(p2)
+    assert (
+        d1["sequences"][0]["proteinChain"]["unpairedMsaPath"]
+        == d2["sequences"][0]["proteinChain"]["unpairedMsaPath"]
+    )
+
+    # OpenFold3 shares one msa_<hash>/colabfold_main.a3m and honors low_mem=False
+    of_dir = tmp_path / "of3"
+    of_dir.mkdir()
+    o1, o2 = OpenfoldJson(of_dir), OpenfoldJson(of_dir)
+    o1.json_to_json(p1)
+    o2.json_to_json(p2)
+    q1 = next(iter(o1.openfold_dict["queries"].values()))["chains"][0]
+    q2 = next(iter(o2.openfold_dict["queries"].values()))["chains"][0]
+    assert q1["main_msa_file_paths"] == q2["main_msa_file_paths"]
+    yml_fast = o1.write_yaml(of_dir / "fast.yml", low_mem=False)
+    assert "low_mem" not in yml_fast
+    yml_low = o1.write_yaml(of_dir / "low.yml", low_mem=True)
+    assert "    - low_mem" in yml_low
+
+    # OpenDDE & ESMFold2 share their content-hashed .a3m files
+    dd_dir = tmp_path / "opendde"
+    dd_dir.mkdir()
+    dd1 = OpenDDEjson(dd_dir).json_to_json(p1)
+    dd2 = OpenDDEjson(dd_dir).json_to_json(p2)
+    assert (
+        dd1["sequences"][0]["proteinChain"]["unpairedMsaPath"]
+        == dd2["sequences"][0]["proteinChain"]["unpairedMsaPath"]
+    )
+
+    es_dir = tmp_path / "esm"
+    es_dir.mkdir()
+    es1 = Esmfold2json(es_dir).json_to_json(p1)
+    es2 = Esmfold2json(es_dir).json_to_json(p2)
+    assert es1["sequences"][0]["msa_path"] == es2["sequences"][0]["msa_path"]
+
+
+def test_many_ligands_library_and_receptor_grouping(tmp_path):
+    from abcfold.batch import (
+        expand_receptor_with_ligands,
+        load_ligand_library,
+        sort_jobs_for_throughput,
+    )
+
+    smi_file = tmp_path / "screen.smi"
+    smi_file.write_text("# comment\nCCO ethanol\nc1ccccc1 benzene\nCCD:ATP atp\n")
+    ligs = load_ligand_library([str(smi_file), "CCCC"])
+    assert [x["id"] for x in ligs] == ["ethanol", "benzene", "atp", "lig_4"]
+    assert ligs[2]["ccd"] == "ATP"
+    assert ligs[3]["smiles"] == "CCCC"
+
+    base = {
+        "name": "kras",
+        "modelSeeds": [1],
+        "sequences": [{"protein": {"id": "A", "sequence": "MTEYKLVVVG"}}],
+    }
+    jobs = expand_receptor_with_ligands(base, ligs, models=["boltz"], n_models=2)
+    assert len(jobs) == 4
+    assert all(j.params["sequences"][-1]["ligand"]["id"] == "B" for j in jobs)
+
+    # Receptor grouping keeps same-receptor ligands contiguous
+    other = {
+        "name": "big_prot",
+        "modelSeeds": [1],
+        "sequences": [{"protein": {"id": "A", "sequence": "A" * 80}}],
+    }
+    other_jobs = expand_receptor_with_ligands(other, ligs[:2], models=["boltz"])
+    interleaved = [jobs[0], other_jobs[0], jobs[1], other_jobs[1], jobs[2]]
+    ordered = sort_jobs_for_throughput(interleaved, descending=True)
+    receptors = [j.protein_sequences[0] for j in ordered]
+    assert receptors[:2] == ["A" * 80, "A" * 80]
+    assert receptors[2:] == ["MTEYKLVVVG"] * 3
+
+
+def test_af3_batch_uses_input_dir_across_gpus(tmp_path, monkeypatch):
+    import abcfold.alphafold3.af3_adapter as af3_mod
+
+    in_dir = tmp_path / "in_dir"
+    in_dir.mkdir()
+    cfg = af3_mod.Af3Config(runner="docker", model_dir=str(tmp_path), gpus="0,1")
+    cmd = af3_mod.build_af3_command(in_dir, tmp_path / "out", cfg, mode="inference")
+    assert any(flag == "--input_dir=/root/af_input" for flag in cmd)
+    assert not any(flag.startswith("--json_path=") for flag in cmd)
+
+    calls = []
+
+    def fake_run(argv, stdout, stderr, env, check):
+        calls.append(argv)
+        # Create fake AF3 output inside the mounted output dir
+        out_mount = next(
+            argv[i + 1].split(":")[0]
+            for i, a in enumerate(argv)
+            if a == "--volume" and ":/root/af_output" in argv[i + 1]
+        )
+        in_mount = next(
+            argv[i + 1].split(":")[0]
+            for i, a in enumerate(argv)
+            if a == "--volume" and ":/root/af_input" in argv[i + 1]
+        )
+        for jf in Path(in_mount).glob("*.json"):
+            nm = json.loads(jf.read_text())["name"].lower()
+            jd = Path(out_mount) / nm
+            jd.mkdir(parents=True, exist_ok=True)
+            (jd / f"{nm}_model.cif").write_text("data_x\n")
+        return types.SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(af3_mod.subprocess, "run", fake_run)
+    p1 = {
+        "name": "job1",
+        "modelSeeds": [1],
+        "sequences": [{"protein": {"id": "A", "sequence": "ACDE"}}],
+    }
+    p2 = {
+        "name": "job2",
+        "modelSeeds": [1],
+        "sequences": [{"protein": {"id": "A", "sequence": "FGHI"}}],
+    }
+    out1, out2 = tmp_path / "o1", tmp_path / "o2"
+    res = af3_mod.run_af3_batch([(p1, out1), (p2, out2)], cfg=cfg, mode="inference")
+    assert len(calls) == 2
+    assert res[out1] is not None and res[out1].ok
+    assert res[out2] is not None and res[out2].ok
+
+
+def test_vectorized_ipsae_and_in_memory_reactifptm_parity(test_data):
+    import numpy as np
+    from abcfold.html.html_utils import _run_reactifptm_in_memory
+    from abcfold.output.file_handlers import CifFile, ConfidenceJsonFile
+    from abcfold.scripts.ipsae import Ipsae
+    from reactifptm import Reactifptm
+
+    af3_dir = Path(test_data.test_alphafold3_6BJ9_)
+    cif_path = af3_dir / "seed-1_sample-0" / "model.cif"
+    pae_path = af3_dir / "seed-1_sample-0" / "confidences.json"
+
+    cif = CifFile(cif_path)
+    pae_obj = ConfidenceJsonFile(pae_path)
+    ipsae = Ipsae(cif, pae_obj)
+    dists = ipsae.get_cb_distance()
+    assert dists.shape == (ipsae.nres, ipsae.nres)
+    assert np.allclose(np.diag(dists), 0.0)
+    scores = ipsae.compute_iptm_ipsae(dists)
+    assert scores["ipsae_d0res_asym"]["A"]["B"] > 0.0
+
+    ref_r = Reactifptm(pae_path, cif_path)
+    ref_r.compute_reactifptm()
+    fast_r = _run_reactifptm_in_memory(ipsae.pae_data, cif_path, pae_path)
+    assert fast_r.reactifptm == ref_r.reactifptm
+    assert fast_r.reactifptm_pairwise == ref_r.reactifptm_pairwise
+    assert fast_r.reactifptm_pairwise_max == ref_r.reactifptm_pairwise_max
+
+
+def test_chai_esm_disk_cache_and_boltz_fast_load(tmp_path, monkeypatch):
+    import sys
+
+    import abcfold.boltz.boltz_worker as bw
+
+    # Test _install_msa_parse_cache caches parse_a3m across repeated paths
+    fake_a3m_mod = types.ModuleType("boltz.data.parse.a3m")
+    parse_calls = []
+
+    def fake_parse_a3m(path, taxonomy=None, max_seqs=4096):
+        parse_calls.append(str(path))
+        return {"parsed": str(path)}
+
+    fake_a3m_mod.parse_a3m = fake_parse_a3m
+    monkeypatch.setitem(sys.modules, "boltz", types.ModuleType("boltz"))
+    monkeypatch.setitem(sys.modules, "boltz.data", types.ModuleType("boltz.data"))
+    monkeypatch.setitem(
+        sys.modules, "boltz.data.parse", types.ModuleType("boltz.data.parse")
+    )
+    monkeypatch.setitem(sys.modules, "boltz.data.parse.a3m", fake_a3m_mod)
+    bw._install_msa_parse_cache()
+    msa_f = tmp_path / "shared.a3m"
+    msa_f.write_text(">q\nGMRES\n")
+    r1 = fake_a3m_mod.parse_a3m(msa_f, max_seqs=8192)
+    r2 = fake_a3m_mod.parse_a3m(msa_f, max_seqs=8192)
+    assert r1 is r2
+    assert len(parse_calls) == 1
+
+    # _fast_load_boltz_checkpoint skips nn.init and calls load_from_checkpoint
+    fallback_called = []
+    init_called = []
+
+    class FakeModel:
+        @classmethod
+        def load_from_checkpoint(cls, ckpt, **kw):
+            fake_torch.nn.init.kaiming_uniform_(None)
+            fallback_called.append((str(ckpt), kw.get("map_location")))
+            return "fallback_ok"
+
+    fake_torch = types.SimpleNamespace(
+        nn=types.SimpleNamespace(
+            init=types.SimpleNamespace(
+                kaiming_uniform_=lambda t: init_called.append(t)
+            )
+        ),
+    )
+    out = bw._fast_load_boltz_checkpoint(
+        fake_torch, FakeModel, tmp_path / "m.ckpt", device="cuda:0"
+    )
+    assert out == "fallback_ok"
+    assert init_called == []
+    assert fallback_called == [(str(tmp_path / "m.ckpt"), "cuda:0")]
+
+    # Test Chai-1 parse_aligned_pqt_to_msa_context caching across ligands
+    import abcfold.chai1.chai as chai_mod
+
+    pqt_calls = []
+    fake_msa_load = types.ModuleType("chai_lab.data.dataset.msas.load")
+
+    def fake_parse_pqt(path, quota_sizes=None):
+        pqt_calls.append(str(path))
+        return {"pqt": str(path)}
+
+    fake_msa_load.parse_aligned_pqt_to_msa_context = fake_parse_pqt
+    fake_chai_pkg = types.ModuleType("chai_lab")
+    fake_chai_pkg.__path__ = []  # type: ignore[attr-defined]
+    fake_chai1 = types.ModuleType("chai_lab.chai1")
+    monkeypatch.setitem(sys.modules, "chai_lab", fake_chai_pkg)
+    monkeypatch.setitem(sys.modules, "chai_lab.chai1", fake_chai1)
+    monkeypatch.setitem(
+        sys.modules, "chai_lab.data", types.ModuleType("chai_lab.data")
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "chai_lab.data.dataset",
+        types.ModuleType("chai_lab.data.dataset"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "chai_lab.data.dataset.msas",
+        types.ModuleType("chai_lab.data.dataset.msas"),
+    )
+    monkeypatch.setitem(
+        sys.modules, "chai_lab.data.dataset.msas.load", fake_msa_load
+    )
+    monkeypatch.setattr(chai_mod, "_ORIG_PARSE_ALIGNED_PQT", None)
+    chai_mod._PQT_MSA_CACHE.clear()
+    chai_mod._install_inference_caches()
+    pqt_f = tmp_path / "receptor.aligned.pqt"
+    pqt_f.write_bytes(b"PAR1")
+    pqt_r1 = fake_msa_load.parse_aligned_pqt_to_msa_context(pqt_f)
+    pqt_r2 = fake_msa_load.parse_aligned_pqt_to_msa_context(pqt_f)
+    assert pqt_r1 is pqt_r2
+    assert len(pqt_calls) == 1
+
+
+def test_intellifold_and_rosettafold_batch_multi_gpu(tmp_path, monkeypatch):
+    import abcfold.intellifold.run_intellifold as rif
+    import abcfold.rosettafold3.run_rosettafold3 as rrf
+
+    if_calls = []
+    rf_calls = []
+    monkeypatch.setattr(
+        rif,
+        "run_intellifold",
+        lambda input_json, output_dir, gpus=None, **kw: (
+            if_calls.append((Path(input_json).name, gpus)) or True
+        ),
+    )
+    monkeypatch.setattr(
+        rrf,
+        "run_rosettafold",
+        lambda input_json, output_dir, gpus=None, **kw: (
+            rf_calls.append((Path(input_json).name, gpus)) or True
+        ),
+    )
+    j1, j2 = tmp_path / "a.json", tmp_path / "b.json"
+    j1.write_text("{}")
+    j2.write_text("{}")
+    o1, o2 = tmp_path / "o1", tmp_path / "o2"
+
+    res_if = rif.run_intellifold_batch([(j1, o1), (j2, o2)], config={}, gpus="0,1")
+    assert res_if == {o1: True, o2: True}
+    assert {g for _, g in if_calls} == {"0", "1"}
+
+    res_rf = rrf.run_rosettafold_batch([(j1, o1), (j2, o2)], config={}, gpus="0,1")
+    assert res_rf == {o1: True, o2: True}
+    assert {g for _, g in rf_calls} == {"0", "1"}

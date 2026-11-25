@@ -8,7 +8,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, Optional, Sequence, Tuple, Union
 
-from abcfold.gpus import to_physical
+from abcfold.gpus import (detect_gpu_slots, fast_torch_env, plan_gpu_workers,
+                          to_physical)
 from abcfold.msa.guard import (ShallowMsaError, check_backend_n_msa,
                                check_protenix_input, min_msa_rows,
                                msa_requested)
@@ -40,7 +41,7 @@ def protenix_runtime_env(
 ) -> dict:
     """Environment variables for a Protenix run."""
     environ = os.environ if environ is None else environ
-    extra = {}
+    extra = fast_torch_env(environ)
     if "LAYERNORM_TYPE" not in environ and not nvcc_available:
         # Without nvcc Protenix fails while JIT-compiling the fused layernorm
         extra["LAYERNORM_TYPE"] = "torch"
@@ -128,27 +129,71 @@ def run_protenix(
             logger.info("Skipping Protenix backend execution in test mode")
             return True
 
-        log_path = output_dir / "protenix.log"
         output_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            assert env is not None
-            env.run(cmd, extra_env=extra_env, log_file=log_path)
-        except subprocess.CalledProcessError as e:
-            output_dir.mkdir(parents=True, exist_ok=True)
-            output_err_file = output_dir / "protenix_error.log"
-            output_err_file.write_text(e.stderr or "")
-            logger.error(
-                "Protenix run failed. Error log is in %s", output_err_file
-            )
-            return False
-
-        if msa_expected and log_path.exists():
+        gpu_slots = detect_gpu_slots(gpus)
+        shard_seeds = (
+            len(seeds) > 1
+            and len(gpu_slots) > 1
+            and gpu_slots != ["cpu"]
+            and gpu_slots != ["all"]
+        )
+        if not shard_seeds:
+            log_path = output_dir / "protenix.log"
             try:
-                check_backend_n_msa("Protenix", log_path.read_text(), min_rows)
-            except ShallowMsaError as exc:
-                (output_dir / "protenix_error.log").write_text(str(exc))
-                logger.error(str(exc))
-                raise
+                assert env is not None
+                env.run(cmd, extra_env=extra_env, log_file=log_path)
+            except subprocess.CalledProcessError as e:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output_err_file = output_dir / "protenix_error.log"
+                output_err_file.write_text(e.stderr or "")
+                logger.error(
+                    "Protenix run failed. Error log is in %s", output_err_file
+                )
+                return False
+            if msa_expected and log_path.exists():
+                try:
+                    check_backend_n_msa("Protenix", log_path.read_text(), min_rows)
+                except ShallowMsaError as exc:
+                    (output_dir / "protenix_error.log").write_text(str(exc))
+                    logger.error(str(exc))
+                    raise
+        else:
+            assert env is not None
+            nvcc_ok = cuda_toolkit_available(env)
+            n_shards = min(len(gpu_slots), len(seeds))
+            shards: list[list[int]] = [[] for _ in range(n_shards)]
+            for idx, s in enumerate(seeds):
+                shards[idx % n_shards].append(s)
+
+            def _run_seed_shard(shard_idx: int) -> bool:
+                s_list = shards[shard_idx]
+                s_cmd = generate_protenix_command(
+                    out_file,
+                    protenix_out_dir,
+                    config,
+                    number_of_models,
+                    num_recycles,
+                    seed=s_list,
+                    diffusion_steps=diffusion_steps,
+                )
+                s_env = protenix_runtime_env(
+                    config, gpus=gpu_slots[shard_idx], nvcc_available=nvcc_ok
+                )
+                s_log = output_dir / f"protenix_shard{shard_idx}.log"
+                try:
+                    env.run(s_cmd, extra_env=s_env, log_file=s_log)
+                except subprocess.CalledProcessError as e:
+                    (output_dir / "protenix_error.log").write_text(e.stderr or "")
+                    logger.error("Protenix shard %d failed", shard_idx)
+                    return False
+                if msa_expected and s_log.exists():
+                    check_backend_n_msa("Protenix", s_log.read_text(), min_rows)
+                return True
+
+            with ThreadPoolExecutor(max_workers=n_shards) as pool:
+                futs = [pool.submit(_run_seed_shard, i) for i in range(n_shards)]
+                if not all(f.result() for f in as_completed(futs)):
+                    return False
 
         # Protenix logs per-sample exceptions and still exits 0
         all_cifs = list(protenix_out_dir.rglob("*.cif"))
@@ -169,10 +214,7 @@ def run_protenix(
 
 
 def _gpu_slot_list(gpus: str) -> list[str]:
-    if gpus in (None, "all", "cpu"):
-        return [gpus or "all"]
-    slots = [g.strip() for g in str(gpus).split(",") if g.strip()]
-    return slots or ["all"]
+    return detect_gpu_slots(gpus)
 
 
 def run_protenix_batch(
@@ -184,6 +226,7 @@ def run_protenix_batch(
     num_recycles: int = 10,
     diffusion_steps: Optional[int] = None,
     gpus: str = "all",
+    workers_per_gpu: Optional[int] = None,
 ) -> dict[Path, bool]:
     """Run many Protenix jobs loading weights once per GPU shard."""
     item_list = [(Path(inp), Path(out)) for inp, out in items]
@@ -195,14 +238,21 @@ def run_protenix_batch(
     env = ensure_protenix_env(config=config)
     nvcc_ok = cuda_toolkit_available(env)
     min_rows = min_msa_rows(config)
-    gpu_slots = _gpu_slot_list(gpus)
+    gpu_slots = plan_gpu_workers(
+        gpus,
+        len(item_list),
+        engine="protenix",
+        workers_per_gpu=workers_per_gpu,
+    )
 
     groups: dict[tuple[int, ...], list[tuple[Path, Path, dict, bool]]] = {}
     with tempfile.TemporaryDirectory(prefix="abcfold-protenix-batch-") as temp_dir:
         work_root = Path(temp_dir)
+        shared_msa_dir = work_root / "msas"
+        shared_msa_dir.mkdir(parents=True, exist_ok=True)
         for inp, job_out in item_list:
             job_out.mkdir(parents=True, exist_ok=True)
-            working_dir = job_out if save_input else work_root / job_out.name
+            working_dir = job_out if save_input else shared_msa_dir
             working_dir.mkdir(parents=True, exist_ok=True)
             raw_params = json.loads(inp.read_text())
             msa_exp = any(

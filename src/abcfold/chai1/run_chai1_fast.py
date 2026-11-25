@@ -9,6 +9,8 @@ from typing import Iterable, Union
 
 from abcfold.chai1.af3_to_chai import ChaiFasta
 from abcfold.chai1.check_install import ensure_chai_env
+from abcfold.gpus import (fast_torch_env, plan_gpu_workers,
+                          to_physical)
 
 logger = logging.getLogger("logger")
 
@@ -43,6 +45,35 @@ def normalize_devices(gpus: str | None) -> list[str | None]:
     if not devices:
         raise ValueError("No valid Chai devices were requested.")
     return devices
+
+
+def _resolve_chai_worker_devices(
+    gpus: str | None,
+    num_tasks: int,
+    *,
+    est_tokens: int = 300,
+    workers_per_gpu: int | None = None,
+) -> list[str | None]:
+    """Expand gpus for multi-GPU and VRAM-aware worker packing."""
+    if gpus == "cpu":
+        return ["cpu"]
+    if gpus is not None and gpus != "all" and ":" in gpus:
+        return normalize_devices(gpus)
+    planned = plan_gpu_workers(
+        gpus,
+        num_tasks,
+        engine="chai1",
+        est_tokens=est_tokens,
+        workers_per_gpu=workers_per_gpu,
+    )
+    if planned == ["cpu"]:
+        return ["cpu"]
+    if planned == ["all"]:
+        return [None] if gpus is None else ["cuda"]
+    return [
+        f"cuda:{slot}" if slot.isdigit() else normalize_device(slot)
+        for slot in planned
+    ]
 
 
 def run_chai_fast(
@@ -96,6 +127,7 @@ def run_chai_batch(
     postprocess: bool = True,
     diffusion_steps: int = 200,
     mmseqs_database: Union[str, Path, None] = None,
+    workers_per_gpu: int | None = None,
 ) -> bool:
     input_paths = [Path(path) for path in input_jsons]
     if not input_paths:
@@ -104,7 +136,8 @@ def run_chai_batch(
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    device_slots = normalize_devices(devices)
+    # Validate explicit device strings early.
+    normalize_devices(devices)
 
     env = None
     kalign_available = True
@@ -132,6 +165,13 @@ def run_chai_batch(
             logger.info("Skipping Chai fast backend execution in test mode")
             return True
 
+        max_tokens = max((int(t.get("est_tokens", 300)) for t in tasks), default=300)
+        device_slots = _resolve_chai_worker_devices(
+            devices,
+            len(tasks),
+            est_tokens=max_tokens,
+            workers_per_gpu=workers_per_gpu,
+        )
         manifests = _write_device_manifests(
             tasks=tasks,
             devices=device_slots,
@@ -153,10 +193,23 @@ def run_chai_batch(
                 "--repo-root",
                 str(repo_root),
             ]
-            extra_env = {}
+            extra_env = fast_torch_env()
+            extra_env.setdefault("DISABLE_PANDERA_IMPORT_WARNING", "True")
             downloads = config.get("chai_downloads_dir")
             if downloads:
                 extra_env["CHAI_DOWNLOADS_DIR"] = str(Path(str(downloads)).expanduser())
+            # Pin physical GPU when device is cuda:N under CUDA_VISIBLE_DEVICES.
+            try:
+                first_task = json.loads(manifest_path.read_text())[0]
+                dev_str = first_task.get("device")
+                if isinstance(dev_str, str) and dev_str.startswith("cuda:"):
+                    slot = dev_str.split(":", 1)[1]
+                    phys = to_physical(slot)
+                    if phys is not None:
+                        extra_env["CUDA_VISIBLE_DEVICES"] = phys
+                        extra_env["ABCFOLD_CHAI_LOCAL_DEVICE"] = "cuda:0"
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 env.run(cmd, extra_env=extra_env)
             except subprocess.CalledProcessError as e:
@@ -205,9 +258,21 @@ def _prepare_tasks(
     test: bool = False,
 ) -> list[dict]:
     tasks = []
+    shared_msa_dir = work_root / "_shared_chai_msa"
+    shared_msa_dir.mkdir(parents=True, exist_ok=True)
     for input_json in input_paths:
         with input_json.open("r") as f:
             input_params = json.load(f)
+        prot_seqs = tuple(
+            s["protein"]["sequence"]
+            for s in input_params.get("sequences", [])
+            if isinstance(s, dict) and "protein" in s
+        )
+        est_tokens = sum(len(seq) for seq in prot_seqs) + 25 * sum(
+            1
+            for s in input_params.get("sequences", [])
+            if isinstance(s, dict) and "ligand" in s
+        )
         case_id = input_params.get("name") or input_json.stem
         case_output_dir = (
             output_dir / "outputs" / case_id if nested_outputs else output_dir
@@ -218,6 +283,20 @@ def _prepare_tasks(
 
         chai_fasta = ChaiFasta(working_dir, config=config)
         chai_fasta.json_to_fasta(input_json)
+        # When batching many ligands sharing a protein, share the MSA dir
+        # so Chai-1 hits its in-process MSA context cache across ligands.
+        msa_dir_for_task = working_dir
+        if not save_input and len(input_paths) > 1:
+            for pqt in working_dir.glob("*.aligned.pqt"):
+                dst_pqt = shared_msa_dir / pqt.name
+                if not dst_pqt.exists():
+                    try:
+                        import os as _os
+                        _os.link(pqt, dst_pqt)
+                    except OSError:
+                        import shutil as _shutil
+                        _shutil.copyfile(pqt, dst_pqt)
+            msa_dir_for_task = shared_msa_dir
         template_hits_path = (
             template_hits_paths.get(input_json) if template_hits_paths else None
         )
@@ -256,10 +335,12 @@ def _prepare_tasks(
                     "case_id": case_id,
                     "case_output_dir": str(case_output_dir),
                     "fasta": str(chai_fasta.fasta),
-                    "msa_dir": str(chai_fasta.working_dir),
+                    "msa_dir": str(msa_dir_for_task),
                     "constraints": str(chai_fasta.constraints),
                     "output_dir": str(seed_output_dir),
                     "seed": seed,
+                    "receptor_sig": "|".join(prot_seqs),
+                    "est_tokens": max(1, est_tokens),
                     "use_templates_server": task_use_templates_server,
                     "template_hits_path": (
                         str(template_hits_path)
@@ -305,6 +386,13 @@ def _write_device_manifests(
         task["diffusion_steps"] = diffusion_steps
         per_device[device_index].append(task)
 
+    # Order each device queue by receptor signature so ligands targeting the
+    # same protein stay consecutive and maximize ESM-2/MSA cache hits.
+    for device_tasks in per_device:
+        device_tasks.sort(
+            key=lambda t: (str(t.get("receptor_sig", "")), str(t.get("case_id", "")))
+        )
+
     manifests = []
     for index, device_tasks in enumerate(per_device):
         if not device_tasks:
@@ -320,6 +408,7 @@ def _write_worker_script(work_root: Path) -> Path:
     worker_script.write_text(textwrap.dedent("""
             import argparse
             import json
+            import os
             import sys
             from pathlib import Path
 
@@ -333,6 +422,7 @@ def _write_worker_script(work_root: Path) -> Path:
             from abcfold.chai1.chai import run_inference_wrapper
 
             tasks = json.loads(args.manifest.read_text())
+            local_dev_override = os.environ.get("ABCFOLD_CHAI_LOCAL_DEVICE")
             for task in tasks:
                 output_dir = Path(task["output_dir"])
                 output_dir.mkdir(parents=True, exist_ok=True)
@@ -357,7 +447,7 @@ def _write_worker_script(work_root: Path) -> Path:
                     num_diffn_timesteps=task.get("diffusion_steps", 200),
                     num_diffn_samples=task["number_of_models"],
                     seed=task["seed"],
-                    device=task["device"],
+                    device=local_dev_override or task["device"],
                 )
             """))
     return worker_script

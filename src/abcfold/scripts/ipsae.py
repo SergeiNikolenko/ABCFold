@@ -3,7 +3,6 @@
 
 import copy
 import logging
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -265,10 +264,10 @@ class Ipsae():
         cb_coords = []
         for chain in self.struct.get_chains():
             for residue in chain:
+                if not is_aa(residue.resname, standard=False):
+                    continue
                 chosen_atom = None
                 for atom in residue:
-                    if not is_aa(residue.resname, standard=False):
-                        continue
                     if atom.id == "CB":
                         chosen_atom = atom
                         break
@@ -282,10 +281,14 @@ class Ipsae():
                 if chosen_atom:
                     cb_coords.append(chosen_atom.get_coord())
 
-        cb_coords = np.array([x for x in cb_coords])
-        distances = np.sqrt(
-            ((cb_coords[:, None, :] - cb_coords[None, :, :])**2).sum(axis=2)
-        )
+        if not cb_coords:
+            return np.zeros((0, 0), dtype=np.float64)
+        coords = np.asarray(cb_coords, dtype=np.float64)
+        sq_norms = np.einsum("ij,ij->i", coords, coords)
+        sq_dist = sq_norms[:, None] + sq_norms[None, :] - 2.0 * (coords @ coords.T)
+        np.maximum(sq_dist, 0.0, out=sq_dist)
+        distances = np.sqrt(sq_dist, out=sq_dist)
+        np.fill_diagonal(distances, 0.0)
         return distances
 
     def compute_pdockq(self, distances, cutoff=8.0):
@@ -312,64 +315,38 @@ class Ipsae():
 
         pdockq_scores = self.nested_chain_map(lambda: 0.0, self.chain_ids)
         pdockq2_scores = self.nested_chain_map(lambda: 0.0, self.chain_ids)
-        unique_residues = self.nested_chain_map(set, self.chain_ids)
-
-        pair_counts = self.nested_chain_map(lambda: 0, self.chain_ids)
-        pae_ptm_sums = self.nested_chain_map(lambda: 0.0, self.chain_ids)
-
-        for i in range(self.nres):
-            c_i = self.chain_res_map[i]
-
-            pc = pair_counts[c_i]
-            ur = unique_residues[c_i]
-            pps = pae_ptm_sums[c_i]
-
-            close_js = np.where(distances[i] <= cutoff)[0]
-            if close_js.size == 0:
-                continue
-
-            per_chain_js = defaultdict(list)
-            for j in close_js:
-                if j == i:
-                    continue
-                c_j = self.chain_res_map[j]
-                if c_j == c_i:
-                    continue
-                per_chain_js[c_j].append(j)
-
-            for c_j, js in per_chain_js.items():
-                js_arr = np.asarray(js, dtype=int)
-
-                n_pairs_here = js_arr.size
-
-                pc[c_j] += n_pairs_here
-                ur[c_j].add(i)
-                ur[c_j].update(js_arr)
-
-                pae_vals = self.pae_matrix[i, js_arr]
-                ptm_vals = self.ptm_func(pae_vals, 10.0)
-                pps[c_j] += ptm_vals.sum()
-
+        chain_idx = {
+            c: np.flatnonzero(self.chain_res_map == c) for c in self.chain_ids
+        }
         for c1 in self.chain_ids:
+            idx1 = chain_idx[c1]
+            if idx1.size == 0:
+                continue
             for c2 in self.chain_ids:
                 if c1 == c2:
                     continue
-
-                n_pairs = pair_counts[c1][c2]
+                idx2 = chain_idx[c2]
+                if idx2.size == 0:
+                    continue
+                sub_dist = distances[np.ix_(idx1, idx2)]
+                close_mask = sub_dist <= cutoff
+                n_pairs = int(close_mask.sum())
                 if n_pairs == 0:
                     pdockq_scores[c1][c2] = 0.0
                     pdockq2_scores[c1][c2] = 0.0
                     continue
-
-                uniq_res_list = sorted(unique_residues[c1][c2])
-                mean_plddt = float(
-                    np.mean(self.plddt[uniq_res_list])
-                    ) if len(uniq_res_list) > 0 else 0.0
+                u1 = idx1[close_mask.any(axis=1)]
+                u2 = idx2[close_mask.any(axis=0)]
+                uniq_res = np.concatenate((u1, u2))
+                mean_plddt = (
+                    float(np.mean(self.plddt[uniq_res])) if uniq_res.size > 0 else 0.0
+                )
 
                 pdq = self.pdockq(mean_plddt, n_pairs)
                 pdockq_scores[c1][c2] = float(np.round(pdq, 4))
 
-                mean_ptm = pae_ptm_sums[c1][c2] / n_pairs
+                sub_pae = self.pae_matrix[np.ix_(idx1, idx2)][close_mask]
+                mean_ptm = float(self.ptm_func(sub_pae, 10.0).sum()) / n_pairs
                 pdq2 = self.pdockq2(mean_plddt, mean_ptm)
                 pdockq2_scores[c1][c2] = float(np.round(pdq2, 4))
         return pdockq_scores, pdockq2_scores
@@ -441,98 +418,62 @@ class Ipsae():
         ipsae_d0dom_asym = self.nested_chain_map(lambda: 0.0, self.chain_ids)
         ipsae_d0res_asym = self.nested_chain_map(lambda: 0.0, self.chain_ids)
 
-        # Track unique residues
-        unique_residues_chain1 = self.nested_chain_map(set, self.chain_ids)
-        unique_residues_chain2 = self.nested_chain_map(set, self.chain_ids)
-        dist_unique_residues_chain1 = self.nested_chain_map(set, self.chain_ids)
-        dist_unique_residues_chain2 = self.nested_chain_map(set, self.chain_ids)
+        unique_res_c1 = self.nested_chain_map(lambda: 0, self.chain_ids)
+        unique_res_c2 = self.nested_chain_map(lambda: 0, self.chain_ids)
+        dist_unique_res_c1 = self.nested_chain_map(lambda: 0, self.chain_ids)
+        dist_unique_res_c2 = self.nested_chain_map(lambda: 0, self.chain_ids)
 
-        # Compute per-residue iPTM / IPSAE
+        chain_idx = {
+            c: np.flatnonzero(self.chain_res_map == c) for c in self.chain_ids
+        }
+
+        # Fully vectorized inter-chain block computation (no Python loops over residues)
         for chain1 in self.chain_ids:
+            idx1 = chain_idx[chain1]
+            if idx1.size == 0:
+                continue
             for chain2 in self.chain_ids:
                 if chain1 == chain2:
                     continue
-
-                n0chn = np.sum(self.chain_res_map == chain1) + \
-                    np.sum(self.chain_res_map == chain2)
-                d0chn = self.calc_d0(n0chn)
-
-                ptm_matrix_d0chn = self.ptm_func(self.pae_matrix, d0chn)
-
-                valid_pairs_iptm = (self.chain_res_map == chain2)
-                valid_pairs_matrix = (self.chain_res_map == chain2) & \
-                    (self.pae_matrix < self.pae_cutoff)
-
-                for i in range(self.nres):
-                    if self.chain_res_map[i] != chain1:
-                        continue
-
-                    # IPSAE / iPTM per residue
-                    valid_pairs_ipsae = valid_pairs_matrix[i]
-                    iptm_d0chn_byres[chain1][chain2][i] = (
-                        ptm_matrix_d0chn[
-                            i, valid_pairs_iptm
-                        ].mean() if valid_pairs_iptm.any() else 0.0
-                    )
-                    ipsae_d0chn_byres[chain1][chain2][i] = (
-                        ptm_matrix_d0chn[
-                            i, valid_pairs_ipsae
-                        ].mean() if valid_pairs_ipsae.any() else 0.0
-                    )
-
-                    # Track unique residues contributing
-                    if valid_pairs_ipsae.any():
-                        unique_residues_chain1[chain1][chain2].add(i)
-                        for j in np.where(valid_pairs_ipsae)[0]:
-                            unique_residues_chain2[chain1][chain2].add(j)
-
-                    valid_pairs = (self.chain_res_map == chain2) & \
-                        (self.pae_matrix[i] < self.pae_cutoff) & \
-                        (distances[i] < self.distance_cutoff)
-                    if valid_pairs.any():
-                        dist_unique_residues_chain1[chain1][chain2].add(i)
-                        for j in np.where(valid_pairs)[0]:
-                            dist_unique_residues_chain2[chain1][chain2].add(j)
-
-        for chain1 in self.chain_ids:
-            for chain2 in self.chain_ids:
-                if chain1 == chain2:
+                idx2 = chain_idx[chain2]
+                if idx2.size == 0:
                     continue
 
-                # Domain-level d0
-                residues_1 = len(unique_residues_chain1[chain1][chain2])
-                residues_2 = len(unique_residues_chain2[chain1][chain2])
-                n0dom = residues_1 + residues_2
-                d0dom = self.calc_d0(n0dom)
+                sub_pae = self.pae_matrix[np.ix_(idx1, idx2)]
+                d0chn = float(self.calc_d0(idx1.size + idx2.size))
+                ptm_chn = 1.0 / (1.0 + np.square(sub_pae / d0chn))
+                iptm_d0chn_byres[chain1][chain2][idx1] = ptm_chn.mean(axis=1)
 
-                # PTM matrix for domain-level IPSAE
-                ptm_matrix_d0dom = self.ptm_func(self.pae_matrix, d0dom)
+                valid_pae = sub_pae < self.pae_cutoff
+                counts = valid_pae.sum(axis=1)
+                has_valid = counts > 0
+                safe_counts = np.where(has_valid, counts, 1)
 
-                # Valid pairs matrix
-                mask_chain2 = (self.chain_res_map == chain2)
-                mask_pae = (self.pae_matrix < self.pae_cutoff)
-                valid_pairs_matrix = mask_pae & mask_chain2[None, :]
+                ipsae_d0chn_byres[chain1][chain2][idx1] = np.where(
+                    has_valid, (ptm_chn * valid_pae).sum(axis=1) / safe_counts, 0.0
+                )
 
-                # Per-residue d0 for IPSAE
-                n0res_byres_all = np.sum(valid_pairs_matrix, axis=1)
-                d0res_byres_all = self.calc_d0(n0res_byres_all)
+                n_u1 = int(has_valid.sum())
+                n_u2 = int(valid_pae.any(axis=0).sum())
+                unique_res_c1[chain1][chain2] = n_u1
+                unique_res_c2[chain1][chain2] = n_u2
 
-                for i in range(self.nres):
-                    if self.chain_res_map[i] != chain1:
-                        continue
+                sub_dist = distances[np.ix_(idx1, idx2)]
+                valid_dist = valid_pae & (sub_dist < self.distance_cutoff)
+                dist_unique_res_c1[chain1][chain2] = int(valid_dist.any(axis=1).sum())
+                dist_unique_res_c2[chain1][chain2] = int(valid_dist.any(axis=0).sum())
 
-                    valid_pairs = valid_pairs_matrix[i]
+                d0dom = float(self.calc_d0(n_u1 + n_u2))
+                ptm_dom = 1.0 / (1.0 + np.square(sub_pae / d0dom))
+                ipsae_d0dom_byres[chain1][chain2][idx1] = np.where(
+                    has_valid, (ptm_dom * valid_pae).sum(axis=1) / safe_counts, 0.0
+                )
 
-                    ipsae_d0dom_byres[chain1][chain2][i] = ptm_matrix_d0dom[
-                        i, valid_pairs
-                    ].mean() if valid_pairs.any() else 0.0
-
-                    ptm_row_d0res = self.ptm_func(
-                        self.pae_matrix[i], d0res_byres_all[i]
-                    )
-                    ipsae_d0res_byres[chain1][chain2][i] = ptm_row_d0res[
-                        valid_pairs
-                    ].mean() if valid_pairs.any() else 0.0
+                d0res = self.calc_d0(counts)[:, None]
+                ptm_res = 1.0 / (1.0 + np.square(sub_pae / d0res))
+                ipsae_d0res_byres[chain1][chain2][idx1] = np.where(
+                    has_valid, (ptm_res * valid_pae).sum(axis=1) / safe_counts, 0.0
+                )
 
         # Compute per-chain-pair iPTM / IPSAE as maximum over residues
         for c1 in self.chain_ids:
@@ -550,22 +491,10 @@ class Ipsae():
             "ipsae_d0chn_asym": ipsae_d0chn_asym,
             "ipsae_d0dom_asym": ipsae_d0dom_asym,
             "ipsae_d0res_asym": ipsae_d0res_asym,
-            "unique_residues_chain1": {
-                c1: {c2: len(res_set) for c2, res_set in inner.items()}
-                for c1, inner in unique_residues_chain1.items()
-            },
-            "unique_residues_chain2": {
-                c1: {c2: len(res_set) for c2, res_set in inner.items()}
-                for c1, inner in unique_residues_chain2.items()
-            },
-            "dist_unique_residues_chain1": {
-                c1: {c2: len(res_set) for c2, res_set in inner.items()}
-                for c1, inner in dist_unique_residues_chain1.items()
-            },
-            "dist_unique_residues_chain2": {
-                c1: {c2: len(res_set) for c2, res_set in inner.items()}
-                for c1, inner in dist_unique_residues_chain2.items()
-            }
+            "unique_residues_chain1": unique_res_c1,
+            "unique_residues_chain2": unique_res_c2,
+            "dist_unique_residues_chain1": dist_unique_res_c1,
+            "dist_unique_residues_chain2": dist_unique_res_c2,
         }
 
     def main(self, output_csv=None, verbose=True):

@@ -1,7 +1,6 @@
+import hashlib
 import json
 import logging
-import random
-import string
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
@@ -61,8 +60,10 @@ class ProtenixJson:
         Returns:
             None
         """
-
-        with open(file_path, "w") as f:
+        out_path = Path(file_path)
+        if out_path.exists() and out_path.stat().st_size > 0:
+            return
+        with open(out_path, "w") as f:
             f.write(msa)
 
     def json_to_json(
@@ -145,8 +146,10 @@ class ProtenixJson:
         from abcfold.msa.guard import entity_msa_text
 
         unpaired_msa, paired_msa = entity_msa_text(seq_dict)
-        random_string = ''.join(random.choices(string.ascii_letters, k=5))
-        msa_dir = Path(self.working_dir) / random_string
+        msa_digest = hashlib.sha256(
+            f"{unpaired_msa or ''}\0{paired_msa or ''}".encode()
+        ).hexdigest()[:16]
+        msa_dir = Path(self.working_dir) / f"msa_{msa_digest}"
         if unpaired_msa:
             unpaired_path = msa_dir / "non_pairing.a3m"
             if self.__create_files:

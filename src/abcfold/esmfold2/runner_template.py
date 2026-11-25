@@ -17,6 +17,8 @@ import json
 import sys
 from pathlib import Path
 
+_MSA_OBJECT_CACHE: dict = {}
+
 
 def build_input(description, esm_mod):
     ProteinInput = esm_mod.ProteinInput
@@ -58,7 +60,12 @@ def build_input(description, esm_mod):
 
         msa_path = entry.get("msa_path")
         if msa_path and entity_type in ("protein", "rna"):
-            kwargs["msa"] = MSA.from_a3m(path=msa_path)
+            resolved_msa = str(Path(msa_path).resolve())
+            if resolved_msa not in _MSA_OBJECT_CACHE:
+                if len(_MSA_OBJECT_CACHE) >= 32:
+                    _MSA_OBJECT_CACHE.pop(next(iter(_MSA_OBJECT_CACHE)))
+                _MSA_OBJECT_CACHE[resolved_msa] = MSA.from_a3m(path=msa_path)
+            kwargs["msa"] = _MSA_OBJECT_CACHE[resolved_msa]
 
         sequences.append(polymer_types[entity_type](**kwargs))
 

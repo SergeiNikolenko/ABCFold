@@ -186,16 +186,14 @@ def _write_json(path: Path, data: dict) -> None:
 
 
 def _parse_gpu_slots(gpus: Optional[str]) -> List[Optional[str]]:
-    """Split an explicit comma-separated --gpus list into individual GPU slots."""
+    """Resolve --gpus into individual visible GPU slots (auto-discovering all GPUs)."""
+    from abcfold.gpus import detect_gpu_slots
+
     if gpus is None:
-        return [None]
-    raw = str(gpus).strip()
-    if not raw or raw.lower() in ("all", "cpu"):
-        return [raw or "all"]
-    slots: List[Optional[str]] = [
-        part.strip() for part in raw.split(",") if part.strip()
-    ]
-    return slots or ["all"]
+        detected = detect_gpu_slots("all")
+        return [None] if detected == ["all"] else list(detected)
+    detected = detect_gpu_slots(gpus)
+    return list(detected)
 
 
 def run(args, settings: Optional[Settings] = None) -> int:
@@ -280,6 +278,86 @@ def run(args, settings: Optional[Settings] = None) -> int:
                 run_json, run_json, max_msa_seqs
             )
             logger.info("Limiting MSA depth to %d sequence(s)", max_msa_seqs)
+
+        ligands_spec = getattr(args, "ligands", None)
+        if ligands_spec:
+            from abcfold.batch import (
+                BatchStatus,
+                _run_batch_phased,
+                expand_receptor_with_ligands,
+                load_ligand_library,
+                sort_jobs_for_throughput,
+            )
+
+            ligand_entries = load_ligand_library(ligands_spec)
+            jobs = sort_jobs_for_throughput(
+                expand_receptor_with_ligands(
+                    input_params,
+                    ligand_entries,
+                    models=engines,
+                    n_models=args.number_of_models,
+                ),
+                descending=True,
+            )
+            logger.info(
+                "Many-ligands screening mode: %d ligand(s) against %s using %s",
+                len(jobs),
+                name,
+                ", ".join(engines),
+            )
+            inputs_dir = args.output_dir / "inputs"
+            logs_dir = args.output_dir / "logs"
+            jobs_dir = args.output_dir / "jobs"
+            for d in (inputs_dir, logs_dir, jobs_dir):
+                d.mkdir(parents=True, exist_ok=True)
+            status = BatchStatus(args.output_dir / "batch_status.json", run_json)
+            parsed_args = {
+                "config_file": getattr(args, "config_file", None),
+                "msa_cache_dir": settings.get("msa_cache_dir"),
+                "msa_server_url": settings.get("msa_server_url"),
+                "num_recycles": args.num_recycles,
+                "diffusion_steps": args.diffusion_steps,
+                "number_of_models": args.number_of_models,
+                "max_msa_seqs": max_msa_seqs,
+                "min_msa_rows": settings.get("min_msa_rows"),
+                "boltz_preprocessing_threads": args.boltz_preprocessing_threads,
+                "boltz_num_workers": args.boltz_num_workers,
+                "boltz_max_parallel_samples": args.boltz_max_parallel_samples,
+                "protenix_model": getattr(args, "protenix_model", None),
+                "template_mirror_dir": args.template_mirror_dir,
+                "inference_ckpt_path": getattr(args, "inference_ckpt_path", None),
+                "save_input": args.save_input,
+                "boltz_use_potentials": bool(
+                    getattr(args, "boltz_use_potentials", False)
+                ),
+                "openfold_fetch_templates": bool(
+                    getattr(args, "openfold_fetch_templates", False)
+                ),
+                "allow_version_mismatch": bool(
+                    getattr(args, "allow_version_mismatch", False)
+                ),
+                "no_paired_msa": bool(getattr(args, "no_paired_msa", False)),
+            }
+            batch_res = _run_batch_phased(
+                todo=jobs,
+                output_dir=args.output_dir,
+                inputs_dir=inputs_dir,
+                logs_dir=logs_dir,
+                jobs_dir=jobs_dir,
+                status=status,
+                gpus=args.gpus,
+                msa="auto",
+                msa_options=None,
+                parsed_args=parsed_args,
+                run_args=(),
+                max_parallel=1,
+                workers_per_gpu=getattr(args, "workers_per_gpu", None),
+            )
+            counts = batch_res.get("counts", {})
+            ok_n = int(counts.get("ok", 0))
+            if ok_n == len(jobs):
+                return EXIT_OK
+            return EXIT_PARTIAL if ok_n > 0 else EXIT_FAILED
 
         # An MSA that was requested but came back (nearly) empty would let every
         # backend fold single-sequence without noticing.
@@ -799,6 +877,7 @@ def _run_rosettafold(args, rt_config, run_json, input_params, name):
         output_dir=args.output_dir,
         save_input=args.save_input,
         number_of_models=args.number_of_models,
+        gpus=args.gpus,
         config=rt_config,
     )
     if not ok:

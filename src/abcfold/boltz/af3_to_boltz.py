@@ -1,8 +1,6 @@
+import hashlib
 import json
 import logging
-import random
-import string
-import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -85,14 +83,20 @@ class BoltzYaml:
         Returns:
             None
         """
-
-        with open(file_path, "w") as f:
+        out_path = Path(file_path)
+        if out_path.exists() and out_path.stat().st_size > 0:
+            return
+        with open(out_path, "w") as f:
             f.write(msa)
 
     def _write_template_cifs(self, templates: list) -> List[str]:
         """Write inline mmCIF templates to .cif files for Boltz."""
         cif_paths: List[str] = []
-        tmpl_dir = Path(self.working_dir) / f"templates_{uuid.uuid4().hex}"
+        payload = "\0".join(
+            str(t.get("mmcif") or "") for t in templates if isinstance(t, dict)
+        )
+        digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
+        tmpl_dir = Path(self.working_dir) / f"templates_{digest}"
         if self.__create_files:
             tmpl_dir.mkdir(parents=True, exist_ok=True)
         for idx, template in enumerate(templates):
@@ -100,7 +104,7 @@ class BoltzYaml:
             if not mmcif:
                 continue
             cif_file = tmpl_dir / f"template_{idx}.cif"
-            if self.__create_files:
+            if self.__create_files and not cif_file.exists():
                 self._normalise_template_cif(mmcif, cif_file)
             cif_paths.append(cif_file.resolve().as_posix())
         return cif_paths
@@ -596,7 +600,9 @@ class BoltzYaml:
                     self.msa_file = "empty"
                 else:
                     suffix = ".csv" if paired else ".a3m"
-                    name = "".join(random.choices(string.ascii_letters, k=5))
+                    msa_key = f"{unpaired or ''}\0{paired or ''}"
+                    digest = hashlib.sha256(msa_key.encode()).hexdigest()[:16]
+                    name = f"msa_{digest}"
                     self.msa_file = Path(self.working_dir) / f"{name}{suffix}"
 
             yaml_string += self.add_sequence_information(sequence_info_dict)

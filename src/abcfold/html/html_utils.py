@@ -2,7 +2,6 @@ import contextlib
 import http.server
 import io
 import threading
-import json
 import logging
 import textwrap
 from itertools import groupby
@@ -34,6 +33,82 @@ except ImportError:  # pragma: no cover - optional dependency
 PORT = 8000
 logger = logging.getLogger("logger")
 _STDOUT_LOCK = threading.Lock()
+
+
+def _run_reactifptm_in_memory(
+    pae_data: dict,
+    model_path: Path,
+    pae_json_fallback: Path | None,
+):
+    """Run Reactifptm directly from the in-memory PAE dict (zero disk re-read)."""
+    assert Reactifptm is not None
+    raw_pae = (
+        pae_data.get("predicted_aligned_error")
+        if isinstance(pae_data, dict) and "predicted_aligned_error" in pae_data
+        else (pae_data.get("pae") if isinstance(pae_data, dict) else None)
+    )
+    if raw_pae is None:
+        if pae_json_fallback is None:
+            raise ValueError("PAE matrix missing for reactifPTM")
+        r = Reactifptm(pae_json_fallback, model_path)
+        r.compute_reactifptm()
+        return r
+
+    pae_arr = np.asarray(raw_pae, dtype=np.float64)
+    tok_chains = pae_data.get("token_chain_ids") if isinstance(pae_data, dict) else None
+    tok_res = pae_data.get("token_res_ids") if isinstance(pae_data, dict) else None
+
+    class _FastReactifptm(Reactifptm):  # type: ignore[misc,valid-type]
+        def parse_pae_file(self, _pae_path):
+            self._token_chain_ids = tok_chains
+            self._token_res_ids = tok_res
+            return pae_arr
+
+        def _score(
+            self,
+            tm_matrix,
+            pair_mask,
+            asym_id,
+            interface=False,
+            contacts=None,
+            row_chain=None,
+        ):
+            # Fast equivalent avoiding dense O(N^2) pair_mask.copy() and zero-row ops.
+            if row_chain is not None:
+                rows = asym_id == row_chain
+                if not rows.any():
+                    return np.nan
+                cols = (asym_id != row_chain) if interface else np.ones_like(rows)
+                if not cols.any():
+                    return np.nan
+                sub_tm = tm_matrix[np.ix_(rows, cols)]
+                if contacts is not None:
+                    sub_mask = contacts[np.ix_(rows, cols)]
+                else:
+                    sub_mask = pair_mask[np.ix_(rows, cols)]
+                row_sums = sub_mask.sum(axis=-1)
+                if not np.any(row_sums):
+                    return np.nan
+                active = row_sums > 0
+                per_row = np.sum(sub_tm[active] * sub_mask[active], axis=-1) / (
+                    1e-8 + row_sums[active]
+                )
+                return float(per_row.max())
+            mask = contacts if contacts is not None else pair_mask
+            if interface:
+                mask = mask * (asym_id[:, None] != asym_id[None, :])
+            row_sums = mask.sum(axis=-1)
+            if not np.any(row_sums):
+                return np.nan
+            active = row_sums > 0
+            per_row = np.sum(tm_matrix[active] * mask[active], axis=-1) / (
+                1e-8 + row_sums[active]
+            )
+            return float(per_row.max())
+
+    r = _FastReactifptm(model_path, model_path)
+    r.compute_reactifptm()
+    return r
 
 
 def get_plddt_regions(plddts: Union[np.ndarray, list]) -> dict:
@@ -176,29 +251,19 @@ def get_model_data(model,
                 and existing_path.is_file()
                 and existing_path.suffix == ".json"
             )
-            if reuse_existing and existing_path is not None:
-                pae_json = existing_path
-            else:
-                pae_json = (
+            reactif = _run_reactifptm_in_memory(
+                ipsae.pae_data,
+                full_model_path,
+                existing_path if reuse_existing else None,
+            )
+            for pair, v in (reactif.reactifptm_pairwise_max or {}).items():
+                pair_label = str(pair).replace("-", "")
+                reactifptm_score.append(f"{pair_label}:{np.round(v, 4)}")
+            with _STDOUT_LOCK, contextlib.redirect_stdout(io.StringIO()):
+                reactif.save_results(
                     full_model_path.parent
-                    / f"{Path(model_path).stem}_pae_af3.json"
+                    / f"{Path(model_path).stem}_reactifptm.json"
                 )
-                with open(pae_json, "w") as fh:
-                    fh.write(json.dumps(ipsae.pae_data, separators=(",", ":")))
-            try:
-                reactif = Reactifptm(pae_json, full_model_path)
-                reactif.compute_reactifptm()
-                for pair, v in (reactif.reactifptm_pairwise_max or {}).items():
-                    pair_label = str(pair).replace("-", "")
-                    reactifptm_score.append(f"{pair_label}:{np.round(v, 4)}")
-                with _STDOUT_LOCK, contextlib.redirect_stdout(io.StringIO()):
-                    reactif.save_results(
-                        full_model_path.parent
-                        / f"{Path(model_path).stem}_reactifptm.json"
-                    )
-            finally:
-                if not reuse_existing:
-                    pae_json.unlink(missing_ok=True)
         except Exception as exc:  # noqa: BLE001
             logger.warning("reactifPTM failed for %s: %s", model.name, exc)
 

@@ -512,14 +512,15 @@ Currently OpenFold3 is unable to create bonded-pairs or alter the number of recy
 ABCFold applies AlphaFast-style pipeline optimizations across both single runs (`abcfold run`) and manifest batches (`abcfold batch`):
 
 - **Persistent GPU workers & single-process multi-seed**:
-  - **Boltz-2** (`run_boltz` and `run_boltz_batch`) runs a persistent worker (`boltz_worker.py`) that parses MSAs/ligands and loads `boltz2_conf.ckpt` once per GPU across all seeds and batch targets, with TF32 and automatic cuEquivariance kernel detection on Ampere+ GPUs. Physical steering potentials stay off by default and can be enabled with `--boltz_use_potentials`.
-  - **Protenix** runs all seeds in one `runner.inference` invocation (`--seeds s1,s2,...`) and combines batch jobs per GPU.
-  - **Chai-1** automatically disables `low_memory` CPU offloading on GPUs with >= 24 GiB VRAM, enables TF32, caches exported TorchScript modules across tasks, and reuses the ESM-2/MSA feature context across seeds of the same complex.
-  - **IntelliFold** and **AlphaFold 3** share a persistent JAX/XLA compilation cache (`jax_cache_dir` / `JAX_COMPILATION_CACHE_DIR`, default `~/.cache/abcfold/jax_cache`) and `XLA_FLAGS="--xla_gpu_enable_triton_gemm=false"`.
-  - **ESMFold2**, **OpenFold3**, and **OpenDDE** load checkpoints once per GPU across batched jobs (`--manifest` / merged queries), and ESMFold2 enables TF32, `torch.inference_mode()`, and auto-detects `mode="fused"` on `esm >= 3.5`.
-- **Multi-GPU & CPU/GPU overlap**:
-  - Passing multiple GPU IDs to `abcfold run` (e.g. `--gpus 0,1`) runs independent predictors concurrently across GPU slots and overlaps CPU output summarization with the next GPU stage.
-  - `abcfold batch` sorts pending jobs by estimated token length (longest-first for balanced multi-GPU makespan) and executes phase-separated batched GPU runs by default (deduplicated MSA prefetch -> batched GPU weights-loaded-once -> parallel CPU reporting). Pass `--no-batched` to fall back to one subprocess per job.
+  - **Boltz-2** (`run_boltz`, `run_boltz_batch`, and affinity scoring) runs a persistent worker (`boltz_worker.py`) with fast checkpoint loading (skipping redundant random parameter initialization), TF32, automatic cuEquivariance kernels on Ampere+ GPUs, cached A3M/CSV parsing across ligands, and an asynchronous writer overlapping disk I/O with GPU inference. Physical steering potentials stay off by default and can be enabled with `--boltz_use_potentials`.
+  - **Chai-1** automatically disables `low_memory` CPU offloading on GPUs with >= 24 GiB VRAM, enables TF32, caches all 6 exported TorchScript checkpoints in-process, persists fp16 ESM-2 embeddings on disk (`~/.cache/abcfold/esm_cache`, configurable via `ABCFOLD_ESM_CACHE_DIR`), caches `.aligned.pqt` MSAs, and reuses ESM-2/MSA contexts across seeds and ligands.
+  - **OpenFold3** automatically omits the `low_mem` preset on >= 30 GiB GPUs (while keeping cuEquivariance triangle kernels enabled), runs all seeds in one process (or shards seeds across multiple GPUs), and merges queries in batch mode.
+  - **Protenix**, **OpenDDE**, **ESMFold2**, and **RosettaFold3** run multi-GPU seed sharding on single targets, load weights once per GPU in batch mode (ESMFold2 also caches parsed `MSA.from_a3m` objects and enables TF32 + `inference_mode()` + `mode="fused"`), and deduplicate content-hashed `.a3m` files across ligands.
+  - **AlphaFold 3** and **IntelliFold** share a persistent JAX/XLA compilation cache (`jax_cache_dir`, default `~/.cache/abcfold/jax_cache`) with `XLA_FLAGS="--xla_gpu_enable_triton_gemm=false"`; AlphaFold 3 batches jobs per GPU via `--input_dir`.
+- **Automatic multi-GPU saturation, VRAM worker packing, and ligand screening**:
+  - Default `--gpus all` auto-discovers every visible GPU (honoring `CUDA_VISIBLE_DEVICES`) to parallelize independent engines, multi-seed runs, affinity scoring, and batch shards across all available cards.
+  - Large 40/80 GiB GPUs automatically pack 2-3 concurrent PyTorch workers per GPU on multi-target/ligand batches when free VRAM comfortably fits the engine budget (override via `--workers-per-gpu` or `ABCFOLD_WORKERS_PER_GPU=1`).
+  - Pass `--ligands <library.smi|csv|tsv|json|SMILES...>` to `abcfold run` for fast receptor-grouped screening (1 MSA fetch, 1 MSA file per backend, 1 ESM-2 embedding, 1 checkpoint load per GPU worker). `abcfold batch` groups jobs by receptor and token length and streams CPU summarization as each engine completes.
 - **Fast CPU post-processing**: compact PAE JSON output, zero-reread preloaded `ConfidenceJsonFile`, cached vectorized clash detection, parallel PAE conversion/scoring, and in-process PAE HTML rendering.
 
 ## Contributing

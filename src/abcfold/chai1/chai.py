@@ -9,9 +9,11 @@
 """Command line interface."""
 
 import contextlib
+import hashlib
 import inspect
 import json
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -27,10 +29,28 @@ _ACTIVE_TEMPLATE_STORE: Path | None = None
 _ORIG_LOAD_EXPORTED: Callable[..., Any] | None = None
 _ORIG_MAKE_FEATURE_CONTEXT: Callable[..., Any] | None = None
 _ORIG_GET_ESM_FOR_SEQS: Callable[..., Any] | None = None
+_ORIG_PARSE_ALIGNED_PQT: Callable[..., Any] | None = None
 _EXPORTED_MODEL_CACHE: dict[tuple[str, str], Any] = {}
 _LAST_FEATURE_CONTEXT: tuple[tuple[Any, ...], Any] | None = None
 _ESM_SEQ_CACHE: dict[str, Any] = {}
 _ESM_SEQ_CACHE_MAX = 64
+_PQT_MSA_CACHE: dict[tuple[Any, ...], Any] = {}
+_PQT_MSA_CACHE_MAX = 32
+
+
+def _esm_disk_cache_dir() -> Path | None:
+    """Return persistent on-disk ESM-2 embedding cache dir, or None if disabled."""
+    raw = os.environ.get("ABCFOLD_ESM_CACHE_DIR")
+    if raw is not None:
+        if raw.strip().lower() in ("", "0", "off", "false", "none"):
+            return None
+        return Path(raw).expanduser()
+    return Path.home() / ".cache" / "abcfold" / "esm_cache"
+
+
+def _esm_cache_file(cache_dir: Path, seq: str) -> Path:
+    digest = hashlib.sha256(seq.encode()).hexdigest()[:32]
+    return cache_dir / f"{digest}.pt"
 
 CITATION = """
 @article{Chai-1-Technical-Report,
@@ -278,7 +298,10 @@ def _install_inference_caches() -> None:
         _ORIG_LOAD_EXPORTED = chai1_mod.load_exported
 
         def _cached_load_exported(comp_key: str, device: Any) -> Any:
-            key = (str(comp_key), str(device))
+            dev_str = str(device)
+            if dev_str == "cuda":
+                dev_str = "cuda:0"
+            key = (str(comp_key), dev_str)
             cached = _EXPORTED_MODEL_CACHE.get(key)
             if cached is not None:
                 return cached
@@ -337,7 +360,39 @@ def _install_inference_caches() -> None:
                 prot_sequences: set[str], device: Any
             ) -> dict[str, Any]:
                 assert _ORIG_GET_ESM_FOR_SEQS is not None
-                missing = {seq for seq in prot_sequences if seq not in _ESM_SEQ_CACHE}
+                import torch
+
+                disk_dir = _esm_disk_cache_dir()
+                missing: set[str] = set()
+                disk_hits = 0
+                emb_ctx_cls = getattr(esm_mod, "EmbeddingContext", None)
+                for seq in prot_sequences:
+                    if seq in _ESM_SEQ_CACHE:
+                        continue
+                    if disk_dir is not None:
+                        cfile = _esm_cache_file(disk_dir, seq)
+                        if cfile.is_file():
+                            try:
+                                loaded = torch.load(
+                                    cfile, map_location="cpu", weights_only=True
+                                )
+                                if (
+                                    emb_ctx_cls is not None
+                                    and isinstance(loaded, torch.Tensor)
+                                ):
+                                    emb: Any = emb_ctx_cls(
+                                        esm_embeddings=loaded.float()
+                                    )
+                                else:
+                                    emb = loaded
+                                if len(_ESM_SEQ_CACHE) >= _ESM_SEQ_CACHE_MAX:
+                                    _ESM_SEQ_CACHE.pop(next(iter(_ESM_SEQ_CACHE)))
+                                _ESM_SEQ_CACHE[seq] = emb
+                                disk_hits += 1
+                                continue
+                            except Exception:  # noqa: BLE001
+                                pass
+                    missing.add(seq)
                 if missing:
                     computed = _ORIG_GET_ESM_FOR_SEQS(
                         prot_sequences=missing, device=device
@@ -346,14 +401,71 @@ def _install_inference_caches() -> None:
                         if len(_ESM_SEQ_CACHE) >= _ESM_SEQ_CACHE_MAX:
                             _ESM_SEQ_CACHE.pop(next(iter(_ESM_SEQ_CACHE)))
                         _ESM_SEQ_CACHE[seq] = emb
+                        raw_tensor = (
+                            emb
+                            if isinstance(emb, torch.Tensor)
+                            else getattr(emb, "esm_embeddings", None)
+                        )
+                        if disk_dir is not None and isinstance(
+                            raw_tensor, torch.Tensor
+                        ):
+                            try:
+                                disk_dir.mkdir(parents=True, exist_ok=True)
+                                cfile = _esm_cache_file(disk_dir, seq)
+                                tmp = cfile.with_suffix(f".tmp.{os.getpid()}")
+                                torch.save(
+                                    raw_tensor.detach().cpu().to(torch.float16), tmp
+                                )
+                                os.replace(tmp, cfile)
+                            except Exception:  # noqa: BLE001
+                                pass
                 elif prot_sequences:
                     logging.info(
-                        "Reusing cached ESM-2 embeddings for %d sequence(s)",
+                        "Reusing cached ESM-2 embeddings for %d seq(s) (%d disk)",
                         len(prot_sequences),
+                        disk_hits,
                     )
                 return {seq: _ESM_SEQ_CACHE[seq] for seq in prot_sequences}
 
             esm_mod._get_esm_contexts_for_sequences = _cached_get_esm
+
+    global _ORIG_PARSE_ALIGNED_PQT
+    if _ORIG_PARSE_ALIGNED_PQT is None:
+        try:
+            import chai_lab.data.dataset.msas.load as msa_load_mod
+        except Exception:  # noqa: BLE001
+            msa_load_mod = None
+        if msa_load_mod is not None and hasattr(
+            msa_load_mod, "parse_aligned_pqt_to_msa_context"
+        ):
+            _ORIG_PARSE_ALIGNED_PQT = msa_load_mod.parse_aligned_pqt_to_msa_context
+
+            def _cached_parse_aligned_pqt(
+                aligned_pqt_path: Path | str, *args: Any, **kwargs: Any
+            ) -> Any:
+                assert _ORIG_PARSE_ALIGNED_PQT is not None
+                try:
+                    p = Path(aligned_pqt_path).resolve()
+                    st = p.stat()
+                    quota = args[0] if args else kwargs.get("quota_sizes", "default")
+                    quota_key = (
+                        tuple(sorted((str(k), v) for k, v in quota.items()))
+                        if isinstance(quota, dict)
+                        else str(quota)
+                    )
+                    key = (str(p), st.st_mtime_ns, st.st_size, quota_key)
+                except Exception:  # noqa: BLE001
+                    return _ORIG_PARSE_ALIGNED_PQT(aligned_pqt_path, *args, **kwargs)
+                cached = _PQT_MSA_CACHE.get(key)
+                if cached is not None:
+                    return cached
+                res = _ORIG_PARSE_ALIGNED_PQT(aligned_pqt_path, *args, **kwargs)
+                if len(_PQT_MSA_CACHE) >= _PQT_MSA_CACHE_MAX:
+                    _PQT_MSA_CACHE.pop(next(iter(_PQT_MSA_CACHE)))
+                _PQT_MSA_CACHE[key] = res
+                return res
+
+            msa_load_mod.parse_aligned_pqt_to_msa_context = _cached_parse_aligned_pqt
 
 
 def build_run_inference_kwargs(

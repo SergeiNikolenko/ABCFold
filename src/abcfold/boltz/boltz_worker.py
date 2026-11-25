@@ -10,14 +10,103 @@ Usage:
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import importlib.util
 import inspect
 import json
 import sys
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+
+@contextlib.contextmanager
+def _skip_param_init(torch_mod: Any) -> Iterator[None]:
+    """Temporarily make torch.nn.init.* no-ops during checkpoint load."""
+    nn_init = torch_mod.nn.init
+    saved: dict[str, Any] = {}
+    noop = lambda tensor, *args, **kwargs: tensor  # noqa: E731
+    for name in (
+        "kaiming_uniform_",
+        "kaiming_normal_",
+        "xavier_uniform_",
+        "xavier_normal_",
+        "normal_",
+        "uniform_",
+        "orthogonal_",
+        "trunc_normal_",
+        "zeros_",
+        "ones_",
+        "constant_",
+    ):
+        fn = getattr(nn_init, name, None)
+        if callable(fn):
+            saved[name] = fn
+            setattr(nn_init, name, noop)
+    try:
+        yield
+    finally:
+        for name, fn in saved.items():
+            setattr(nn_init, name, fn)
+
+
+def _fast_load_boltz_checkpoint(
+    torch_mod: Any,
+    model_cls: Any,
+    ckpt_path: Path,
+    *,
+    device: str,
+    strict: bool = True,
+    **kwargs: Any,
+) -> Any:
+    """Load a Boltz2 checkpoint while skipping redundant random weight init."""
+    with _skip_param_init(torch_mod):
+        return model_cls.load_from_checkpoint(
+            ckpt_path,
+            strict=strict,
+            map_location=device,
+            **kwargs,
+        )
+
+
+def _install_msa_parse_cache() -> None:
+    """Cache parsed A3M/CSV MSAs in memory across targets in the same batch.
+
+    In many-ligands screening, every ligand YAML references the exact same
+    receptor MSA file; caching avoids re-parsing a 16k-row A3M N times.
+    """
+    cache: dict[tuple[str, str, int | None], Any] = {}
+    for mod_name, fn_name in (
+        ("boltz.data.parse.a3m", "parse_a3m"),
+        ("boltz.data.parse.csv", "parse_csv"),
+    ):
+        try:
+            mod = __import__(mod_name, fromlist=[fn_name])
+            orig = getattr(mod, fn_name, None)
+            if orig is None or getattr(orig, "_abcfold_cached", False):
+                continue
+
+            def _make_cached(f: Any, tag: str) -> Any:
+                def _wrapped(path: Any, *args: Any, **kwargs: Any) -> Any:
+                    max_seqs = kwargs.get("max_seqs")
+                    if max_seqs is None and len(args) >= 2:
+                        max_seqs = args[1]
+                    key = (tag, str(Path(path).resolve()), max_seqs)
+                    if key in cache:
+                        return cache[key]
+                    val = f(path, *args, **kwargs)
+                    if len(cache) < 64:
+                        cache[key] = val
+                    return val
+
+                _wrapped._abcfold_cached = True  # type: ignore[attr-defined]
+                return _wrapped
+
+            setattr(mod, fn_name, _make_cached(orig, mod_name))
+        except Exception:  # noqa: BLE001
+            continue
 
 
 def _supports_kernels(torch_mod: Any) -> bool:
@@ -67,6 +156,10 @@ def main() -> int:
 
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+    _install_msa_parse_cache()
 
     cache = Path(spec["cache"]).expanduser()
     cache.mkdir(parents=True, exist_ok=True)
@@ -196,11 +289,14 @@ def main() -> int:
     precision: Any = "bf16-mixed" if accelerator == "gpu" else 32
 
     # Load Boltz2 structure checkpoint ONCE and reuse across every seed.
-    model_module = Boltz2.load_from_checkpoint(
+    target_device = "cuda:0" if accelerator == "gpu" else "cpu"
+    model_module = _fast_load_boltz_checkpoint(
+        torch,
+        Boltz2,
         cache / "boltz2_conf.ckpt",
+        device=target_device,
         strict=True,
         predict_args=predict_args,
-        map_location="cuda:0" if accelerator == "gpu" else "cpu",
         diffusion_process_args=asdict(diffusion_params),
         ema=False,
         use_kernels=use_kernels,
@@ -209,6 +305,53 @@ def main() -> int:
         steering_args=asdict(steering_args),
     )
     model_module.eval()
+
+    class _AsyncBoltzWriter(BoltzWriter):
+        """Overlap mmCIF/NPZ/JSON disk writes with GPU compute of next batch."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._io_pool = ThreadPoolExecutor(max_workers=1)
+            self._io_futs: list[Future[Any]] = []
+
+        def write_on_batch_end(
+            self,
+            trainer: Any,
+            pl_module: Any,
+            prediction: Any,
+            *args: Any,
+            **kwargs: Any,
+        ) -> None:
+            # Detach/move tensors to CPU before handing off to writer thread.
+            def _to_cpu(obj: Any) -> Any:
+                if isinstance(obj, torch.Tensor):
+                    return obj.detach().cpu()
+                if isinstance(obj, dict):
+                    return {k: _to_cpu(v) for k, v in obj.items()}
+                if isinstance(obj, list):
+                    return [_to_cpu(v) for v in obj]
+                if isinstance(obj, tuple):
+                    return tuple(_to_cpu(v) for v in obj)
+                return obj
+
+            cpu_pred = _to_cpu(prediction)
+            fut = self._io_pool.submit(
+                super().write_on_batch_end,
+                trainer,
+                pl_module,
+                cpu_pred,
+                *args,
+                **kwargs,
+            )
+            self._io_futs.append(fut)
+
+        def flush(self) -> None:
+            try:
+                for fut in self._io_futs:
+                    fut.result()
+            finally:
+                self._io_futs.clear()
+                self._io_pool.shutdown(wait=True)
 
     seed_record_ids_raw = spec.get("seed_record_ids")
     seed_record_ids: dict[int, set[str]] | None = (
@@ -271,7 +414,7 @@ def main() -> int:
                 override_method=method,
             )
         )
-        pred_writer = BoltzWriter(
+        pred_writer = _AsyncBoltzWriter(
             data_dir=processed.targets_dir,
             output_dir=predictions_dir,
             output_format="mmcif",
@@ -288,11 +431,14 @@ def main() -> int:
             logger=False,
             enable_progress_bar=False,
         )
-        trainer.predict(
-            model_module,
-            datamodule=dm,
-            return_predictions=False,
-        )
+        try:
+            trainer.predict(
+                model_module,
+                datamodule=dm,
+                return_predictions=False,
+            )
+        finally:
+            pred_writer.flush()
 
     # If any YAML requested native Boltz-2 affinity, load boltz2_aff.ckpt ONCE.
     if any(r.affinity for r in manifest.records):
@@ -316,11 +462,13 @@ def main() -> int:
             aff_steering.fk_steering = False
             aff_steering.physical_guidance_update = False
             aff_steering.contact_guidance_update = False
-            aff_model = Boltz2.load_from_checkpoint(
+            aff_model = _fast_load_boltz_checkpoint(
+                torch,
+                Boltz2,
                 aff_ckpt,
+                device=target_device,
                 strict=True,
                 predict_args=predict_aff_args,
-                map_location="cuda:0" if accelerator == "gpu" else "cpu",
                 diffusion_process_args=asdict(diffusion_params),
                 ema=False,
                 use_kernels=use_kernels,

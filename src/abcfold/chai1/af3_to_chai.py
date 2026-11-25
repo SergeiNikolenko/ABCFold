@@ -1,6 +1,8 @@
 import hashlib
 import json
 import logging
+import os
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -142,12 +144,46 @@ check back for updates"
         Paired rows carry their row index as pairing key so Chai pairs them
         across chains; the conversion runs in-process (no backend env needed).
         """
+        target = Path(file_path).absolute()
+        if target.exists() and target.stat().st_size > 0:
+            return
+
+        cache_env = os.environ.get("ABCFOLD_CHAI_MSA_CACHE_DIR")
+        cache_path: Optional[Path] = None
+        if cache_env not in ("0", "off", "false"):
+            cache_root = (
+                Path(cache_env).expanduser()
+                if cache_env
+                else Path.home() / ".cache" / "abcfold" / "chai_msa"
+            )
+            digest = hashlib.sha256(
+                f"{msa or ''}\0{paired_msa or ''}".encode()
+            ).hexdigest()[:24]
+            cache_path = cache_root / f"{digest}.aligned.pqt"
+            if cache_path.is_file() and cache_path.stat().st_size > 0:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    os.link(cache_path, target)
+                except OSError:
+                    shutil.copyfile(cache_path, target)
+                logger.debug("Reused cached Chai MSA parquet %s", cache_path)
+                return
+
         from abcfold.msa.formats import chai_msa_frame
 
         df = chai_msa_frame(msa, paired_msa)
         if not df.empty:
-            df.to_parquet(Path(file_path).absolute())
-            logger.debug("Wrote Chai MSA parquet to %s", file_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            df.to_parquet(target)
+            logger.debug("Wrote Chai MSA parquet to %s", target)
+            if cache_path is not None:
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = cache_path.with_suffix(f".tmp.{os.getpid()}")
+                    shutil.copyfile(target, tmp)
+                    os.replace(tmp, cache_path)
+                except OSError:
+                    pass
 
     def json_to_fasta(self, json_file_or_dict: Union[dict, str, Path]):
         """

@@ -45,6 +45,24 @@ def main_argpase_util(parser):
         help="GPU device(s) to use, e.g. 'all', '0', '0,1', 'cpu'",
     )
     parser.add_argument(
+        "--workers_per_gpu",
+        "--workers-per-gpu",
+        dest="workers_per_gpu",
+        type=int,
+        default=None,
+        help=dedent("[optional] Concurrent worker processes per GPU in batched "
+                    "and ligand-screening modes (default: auto from free VRAM)"),
+    )
+    parser.add_argument(
+        "--ligands",
+        nargs="+",
+        default=None,
+        help=dedent("[optional] Fast many-ligands screening against the input "
+                    "receptor: pass a .smi/.csv/.tsv/.json library file or "
+                    "inline SMILES / CCD:<code> entries. Shares 1 MSA fetch, "
+                    "1 ESM-2 embedding, and 1 checkpoint load per GPU worker."),
+    )
+    parser.add_argument(
         "--allow_version_mismatch",
         action="store_true",
         help=dedent("[optional] Run a backend even if its env has a different \

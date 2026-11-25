@@ -7,7 +7,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable, Optional, Tuple, Union
 
-from abcfold.gpus import cuda_env
+from abcfold.gpus import (cuda_env, detect_gpu_slots, fast_torch_env,
+                          plan_gpu_workers)
 from abcfold.opendde.af3_to_opendde import OpenDDEjson
 from abcfold.opendde.check_install import ensure_opendde_env
 from abcfold.output.cofolding_common import input_dir_for
@@ -83,29 +84,68 @@ def run_opendde(
             else generate_opendde_test_command()
         )
 
-        extra_env = cuda_env(gpus)
+        seeds = [int(s) for s in opendde_json.seeds] or [42]
+        gpu_slots = detect_gpu_slots(gpus)
+        shard_seeds = (
+            not test
+            and len(seeds) > 1
+            and len(gpu_slots) > 1
+            and gpu_slots != ["cpu"]
+            and gpu_slots != ["all"]
+        )
         root_dir = config.get("opendde_root_dir")
-        if root_dir:
-            # Checkpoints and the template assets land here instead of
-            # ~/.cache/opendde, so environments and hosts can share them.
-            extra_env["OPENDDE_ROOT_DIR"] = str(Path(str(root_dir)).expanduser())
 
-        try:
-            env.run(cmd, extra_env=extra_env)
-        except subprocess.CalledProcessError as e:
-            stderr = e.stderr or ""
-            if stderr:
-                # The working directory is temporary unless --save_input is
-                # set, so the log goes next to the results where it survives.
-                output_dir.mkdir(parents=True, exist_ok=True)
-                output_err_file = output_dir / "opendde_error.log"
-                output_err_file.write_text(stderr)
-                logger.error(
-                    "OpenDDE run failed. Error log is in %s", output_err_file
+        def _make_env(slot: Optional[str]) -> dict:
+            e = {**fast_torch_env(), **cuda_env(slot)}
+            if root_dir:
+                e["OPENDDE_ROOT_DIR"] = str(Path(str(root_dir)).expanduser())
+            return e
+
+        if not shard_seeds:
+            try:
+                env.run(cmd, extra_env=_make_env(gpus))
+            except subprocess.CalledProcessError as e:
+                stderr = e.stderr or ""
+                if stderr:
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    output_err_file = output_dir / "opendde_error.log"
+                    output_err_file.write_text(stderr)
+                    logger.error(
+                        "OpenDDE run failed. Error log is in %s", output_err_file
+                    )
+                else:
+                    logger.error("OpenDDE run failed")
+                return False
+        else:
+            n_shards = min(len(gpu_slots), len(seeds))
+            shards: list[list[int]] = [[] for _ in range(n_shards)]
+            for idx, s in enumerate(seeds):
+                shards[idx % n_shards].append(s)
+
+            def _run_seed_shard(shard_idx: int) -> bool:
+                s_cmd = generate_opendde_command(
+                    out_file,
+                    opendde_out_dir,
+                    config,
+                    number_of_models,
+                    shards[shard_idx],
+                    use_msa=opendde_json.uses_msa,
+                    num_recycles=num_recycles,
                 )
-            else:
-                logger.error("OpenDDE run failed")
-            return False
+                try:
+                    env.run(s_cmd, extra_env=_make_env(gpu_slots[shard_idx]))
+                except subprocess.CalledProcessError as e:
+                    if e.stderr:
+                        output_dir.mkdir(parents=True, exist_ok=True)
+                        (output_dir / "opendde_error.log").write_text(e.stderr)
+                    logger.error("OpenDDE shard %d failed", shard_idx)
+                    return False
+                return True
+
+            with ThreadPoolExecutor(max_workers=n_shards) as pool:
+                futs = [pool.submit(_run_seed_shard, i) for i in range(n_shards)]
+                if not all(f.result() for f in as_completed(futs)):
+                    return False
 
     logger.info("OpenDDE run complete")
     logger.info("Output files are in %s", output_dir)
@@ -113,12 +153,7 @@ def run_opendde(
 
 
 def _gpu_slot_list(gpus: Optional[str]) -> list[Optional[str]]:
-    if gpus in (None, "all", "cpu"):
-        return [gpus]
-    slots: list[Optional[str]] = [
-        g.strip() for g in str(gpus).split(",") if g.strip()
-    ]
-    return slots or ["all"]
+    return list(detect_gpu_slots(gpus))
 
 
 def run_opendde_batch(
@@ -129,6 +164,7 @@ def run_opendde_batch(
     number_of_models: int = 5,
     num_recycles: int = 10,
     gpus: Optional[str] = "all",
+    workers_per_gpu: Optional[int] = None,
 ) -> dict[Path, bool]:
     """Run many OpenDDE jobs in one invocation per GPU (weights loaded once)."""
     item_list = [(Path(inp), Path(out)) for inp, out in items]
@@ -138,18 +174,27 @@ def run_opendde_batch(
         return {out: True for _, out in item_list}
 
     env = ensure_opendde_env(config=config)
-    gpu_slots = _gpu_slot_list(gpus)
+    gpu_slots: list[Optional[str]] = list(
+        plan_gpu_workers(
+            gpus,
+            len(item_list),
+            engine="opendde",
+            workers_per_gpu=workers_per_gpu,
+        )
+    )
     results: dict[Path, bool] = {out: False for _, out in item_list}
 
     with tempfile.TemporaryDirectory(prefix="abcfold-opendde-batch-") as temp_dir:
         work_root = Path(temp_dir)
+        shared_msa_dir = work_root / "msas"
+        shared_msa_dir.mkdir(parents=True, exist_ok=True)
         groups: dict[tuple[tuple[int, ...], bool], list[tuple[Path, dict]]] = {}
         for idx, (inp, job_out) in enumerate(item_list):
             job_out.mkdir(parents=True, exist_ok=True)
             working_dir = (
                 input_dir_for(job_out, "opendde")
                 if save_input
-                else work_root / f"job_{idx}"
+                else shared_msa_dir
             )
             working_dir.mkdir(parents=True, exist_ok=True)
             oj = OpenDDEjson(working_dir)
@@ -178,7 +223,7 @@ def run_opendde_batch(
                 use_msa=use_msa,
                 num_recycles=num_recycles,
             )
-            extra_env = cuda_env(gpu_slot)
+            extra_env = {**fast_torch_env(), **cuda_env(gpu_slot)}
             root_dir = config.get("opendde_root_dir")
             if root_dir:
                 extra_env["OPENDDE_ROOT_DIR"] = str(Path(str(root_dir)).expanduser())

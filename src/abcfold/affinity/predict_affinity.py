@@ -3,6 +3,7 @@
 # external boltzina package (whose PyPI pins conflict with boltz[cuda]==2.2.1).
 
 import gc
+import importlib.util
 import inspect
 from dataclasses import asdict
 from pathlib import Path
@@ -170,6 +171,20 @@ def _resolve_cache_dir(cache_dir: Optional[Union[str, Path]]) -> Path:
     return Path(get_cache_path())
 
 
+def _auto_use_kernels() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        if torch.cuda.get_device_properties(0).major < 8:
+            return False
+        return (
+            importlib.util.find_spec("cuequivariance_ops_torch") is not None
+            or importlib.util.find_spec("cuequivariance_ops_cu12") is not None
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def load_boltz2_model(
     affinity_checkpoint: Optional[Union[str, Path]] = None,
     sampling_steps_affinity: int = 200,
@@ -181,7 +196,7 @@ def load_boltz2_model(
     affinity_mw_correction: bool = False,
     skip_run_structure: bool = True,
     confidence_prediction: bool = False,
-    use_kernels: bool = False,
+    use_kernels: Optional[bool] = None,
     run_trunk_and_structure: bool = True,
     predict_affinity_args: Optional[dict[str, Any]] = None,
     pairformer_args: Optional[dict[str, Any]] = None,
@@ -200,6 +215,14 @@ def load_boltz2_model(
     )
     if not ckpt.exists():
         raise FileNotFoundError(f"Affinity checkpoint not found at {ckpt}")
+
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    resolved_use_kernels = (
+        _auto_use_kernels() if use_kernels is None else bool(use_kernels)
+    )
 
     if predict_affinity_args is None:
         predict_affinity_args = {
@@ -240,22 +263,45 @@ def load_boltz2_model(
         }
 
     model_cls = _BaseBoltz2 if _HAS_BOLTZINA else _FixedPoseBoltz2
-    model_module = model_cls.load_from_checkpoint(
-        ckpt,
-        strict=True,
-        predict_args=predict_affinity_args,
-        map_location="cpu",
-        diffusion_process_args=diffusion_params,
-        ema=False,
-        pairformer_args=pairformer_args,
-        msa_args=msa_args,
-        steering_args=steering_args,
-        affinity_mw_correction=affinity_mw_correction,
-        skip_run_structure=skip_run_structure,
-        run_trunk_and_structure=run_trunk_and_structure,
-        confidence_prediction=True,
-        use_kernels=use_kernels,
-    )
+    target_dev = "cuda:0" if torch.cuda.is_available() else "cpu"
+    try:
+        from abcfold.boltz.boltz_worker import _fast_load_boltz_checkpoint
+
+        model_module = _fast_load_boltz_checkpoint(
+            torch,
+            model_cls,
+            ckpt,
+            device=target_dev,
+            strict=True,
+            predict_args=predict_affinity_args,
+            diffusion_process_args=diffusion_params,
+            ema=False,
+            pairformer_args=pairformer_args,
+            msa_args=msa_args,
+            steering_args=steering_args,
+            affinity_mw_correction=affinity_mw_correction,
+            skip_run_structure=skip_run_structure,
+            run_trunk_and_structure=run_trunk_and_structure,
+            confidence_prediction=True,
+            use_kernels=resolved_use_kernels,
+        )
+    except Exception:  # noqa: BLE001
+        model_module = model_cls.load_from_checkpoint(
+            ckpt,
+            strict=True,
+            predict_args=predict_affinity_args,
+            map_location=target_dev,
+            diffusion_process_args=diffusion_params,
+            ema=False,
+            pairformer_args=pairformer_args,
+            msa_args=msa_args,
+            steering_args=steering_args,
+            affinity_mw_correction=affinity_mw_correction,
+            skip_run_structure=skip_run_structure,
+            run_trunk_and_structure=run_trunk_and_structure,
+            confidence_prediction=True,
+            use_kernels=resolved_use_kernels,
+        )
     model_module.confidence_prediction = confidence_prediction
     model_module.eval()
     return model_module
@@ -345,12 +391,13 @@ def predict_affinity(
         output_dir=predictions_path,
     )
 
+    eff_num_workers = 0 if len(manifest.records) <= 2 else num_workers
     dm_kwargs: dict[str, Any] = {
         "manifest": manifest,
         "target_dir": predictions_path,
         "msa_dir": msa_path,
         "mol_dir": mol_dir,
-        "num_workers": num_workers,
+        "num_workers": eff_num_workers,
         "constraints_dir": constraints_path,
         "template_dir": template_path,
         "extra_mols_dir": extra_mols_path,
