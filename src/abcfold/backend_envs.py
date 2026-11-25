@@ -343,8 +343,6 @@ _TRITON_BACKENDS = frozenset(
 def _prune_env_cmd(prefix: str) -> str:
     return (
         f"find {prefix} -type f -name '*.a' -delete"
-        f" && find {prefix}/lib/python*/site-packages -maxdepth 3 -type d"
-        r" \( -name test -o -name tests \) -exec rm -rf {} +"
         f" && rm -rf {prefix}/lib/python*/{{test,idlelib,tkinter,ensurepip}}"
         f" {prefix}/lib/python*/site-packages/torch/{{test,include,share}}"
         f" {prefix}/lib/python*/site-packages/triton/backends/amd"
