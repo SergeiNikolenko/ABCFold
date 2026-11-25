@@ -413,7 +413,8 @@ def container_recipe(
         steps = _recipe_steps(
             spec, strip=strip, uv_bin="/usr/local/bin/uv", use_cache_mount=True
         )
-        joined = " \\n    && ".join(steps)
+        joined = " \
+    && ".join(steps)
         needs_triton = spec.name in _TRITON_BACKENDS
         lines = [
             "# syntax=docker/dockerfile:1.7",

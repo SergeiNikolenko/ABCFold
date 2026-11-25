@@ -112,6 +112,8 @@ def test_docker_recipe_is_a_dockerfile():
     jax_recipe = container_recipe(spec_for("intellifold"), kind="docker")
     assert "gcr.io/distroless/cc-debian12" in jax_recipe
     assert "COPY --from=builder /usr/bin/env /usr/bin/env" in jax_recipe
+    assert "\\n" not in recipe
+    assert "\\n" not in jax_recipe
 
 
 def test_keep_unused_recipe_keeps_the_wheels():
